@@ -165,8 +165,8 @@
   document.documentElement.appendChild(host);
   const root = host.attachShadow({ mode: 'open' });
 
-  root.innerHTML = `
-    <style>
+  const styleEl = document.createElement('style');
+  styleEl.textContent = `
       :host { all: initial; }
       *, *::before, *::after { box-sizing: border-box; }
 
@@ -335,39 +335,106 @@
         #panel { right: 8px; left: 8px; width: auto; bottom: 84px; max-height: 76vh; }
         #fab { right: 16px; bottom: 16px; }
       }
-    </style>
-
-    <button id="fab" type="button" title="Baixar vídeo" aria-label="Baixar vídeo" aria-expanded="false" aria-controls="panel" hidden>
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <path d="M12 4v10m0 0 4-4m-4 4-4-4M5 19h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-    </button>
-
-    <section id="panel" hidden role="dialog" aria-label="YouTube Downloader">
-      <header>
-        <div class="hdr-text">
-          <div class="hdr-title">Baixar vídeo</div>
-          <div class="hdr-sub" id="vid-title"></div>
-        </div>
-        <button id="close" type="button" title="Fechar" aria-label="Fechar">✕</button>
-      </header>
-      <nav class="tabs" role="tablist" aria-label="Tipo de download">
-        <button class="tab active" data-tab="video" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="body">Vídeo (MP4)</button>
-        <button class="tab" data-tab="audio" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="body">Áudio (MP3)</button>
-      </nav>
-      <div id="body" role="status" aria-live="polite"></div>
-      <div id="tasks" role="status" aria-live="polite" hidden></div>
-    </section>
   `;
 
+  const fabBtn = document.createElement('button');
+  fabBtn.id = 'fab';
+  fabBtn.type = 'button';
+  fabBtn.title = 'Baixar vídeo';
+  fabBtn.setAttribute('aria-label', 'Baixar vídeo');
+  fabBtn.setAttribute('aria-expanded', 'false');
+  fabBtn.setAttribute('aria-controls', 'panel');
+  fabBtn.hidden = true;
+
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const fabSvg = document.createElementNS(svgNS, 'svg');
+  fabSvg.setAttribute('width', '24');
+  fabSvg.setAttribute('height', '24');
+  fabSvg.setAttribute('viewBox', '0 0 24 24');
+  fabSvg.setAttribute('fill', 'none');
+  fabSvg.setAttribute('aria-hidden', 'true');
+  const fabPath = document.createElementNS(svgNS, 'path');
+  fabPath.setAttribute('d', 'M12 4v10m0 0 4-4m-4 4-4-4M5 19h14');
+  fabPath.setAttribute('stroke', 'currentColor');
+  fabPath.setAttribute('stroke-width', '2');
+  fabPath.setAttribute('stroke-linecap', 'round');
+  fabPath.setAttribute('stroke-linejoin', 'round');
+  fabSvg.appendChild(fabPath);
+  fabBtn.appendChild(fabSvg);
+
+  const panelSec = document.createElement('section');
+  panelSec.id = 'panel';
+  panelSec.hidden = true;
+  panelSec.setAttribute('role', 'dialog');
+  panelSec.setAttribute('aria-label', 'YouTube Downloader');
+
+  const headerEl = document.createElement('header');
+  const hdrText = document.createElement('div');
+  hdrText.className = 'hdr-text';
+  const hdrTitle = document.createElement('div');
+  hdrTitle.className = 'hdr-title';
+  hdrTitle.textContent = 'Baixar vídeo';
+  const vidTitle = document.createElement('div');
+  vidTitle.className = 'hdr-sub';
+  vidTitle.id = 'vid-title';
+  hdrText.append(hdrTitle, vidTitle);
+
+  const closeBtn = document.createElement('button');
+  closeBtn.id = 'close';
+  closeBtn.type = 'button';
+  closeBtn.title = 'Fechar';
+  closeBtn.setAttribute('aria-label', 'Fechar');
+  closeBtn.textContent = '✕';
+  headerEl.append(hdrText, closeBtn);
+
+  const tabsNav = document.createElement('nav');
+  tabsNav.className = 'tabs';
+  tabsNav.setAttribute('role', 'tablist');
+  tabsNav.setAttribute('aria-label', 'Tipo de download');
+
+  const tabVideo = document.createElement('button');
+  tabVideo.className = 'tab active';
+  tabVideo.dataset.tab = 'video';
+  tabVideo.type = 'button';
+  tabVideo.setAttribute('role', 'tab');
+  tabVideo.setAttribute('aria-selected', 'true');
+  tabVideo.tabIndex = 0;
+  tabVideo.setAttribute('aria-controls', 'body');
+  tabVideo.textContent = 'Vídeo (MP4)';
+
+  const tabAudio = document.createElement('button');
+  tabAudio.className = 'tab';
+  tabAudio.dataset.tab = 'audio';
+  tabAudio.type = 'button';
+  tabAudio.setAttribute('role', 'tab');
+  tabAudio.setAttribute('aria-selected', 'false');
+  tabAudio.tabIndex = -1;
+  tabAudio.setAttribute('aria-controls', 'body');
+  tabAudio.textContent = 'Áudio (MP3)';
+  tabsNav.append(tabVideo, tabAudio);
+
+  const bodyDiv = document.createElement('div');
+  bodyDiv.id = 'body';
+  bodyDiv.setAttribute('role', 'status');
+  bodyDiv.setAttribute('aria-live', 'polite');
+
+  const tasksDiv = document.createElement('div');
+  tasksDiv.id = 'tasks';
+  tasksDiv.setAttribute('role', 'status');
+  tasksDiv.setAttribute('aria-live', 'polite');
+  tasksDiv.hidden = true;
+
+  panelSec.append(headerEl, tabsNav, bodyDiv, tasksDiv);
+  root.append(styleEl, fabBtn, panelSec);
+
   const el = {
-    fab: root.getElementById('fab'),
-    panel: root.getElementById('panel'),
-    title: root.getElementById('vid-title'),
-    body: root.getElementById('body'),
-    tasks: root.getElementById('tasks'),
-    close: root.getElementById('close'),
-    tabs: Array.from(root.querySelectorAll('.tab')),
+    fab: fabBtn,
+    panel: panelSec,
+    title: vidTitle,
+    body: bodyDiv,
+    tasks: tasksDiv,
+    close: closeBtn,
+    tabs: [tabVideo, tabAudio],
   };
 
   /* ------------------------------------------------------------------ *
@@ -388,26 +455,42 @@
   function createTask(label, controller, filename) {
     const node = document.createElement('div');
     node.className = 'task';
-    node.innerHTML = `
-      <div class="task-top">
-        <span class="task-label"></span>
-        <button class="task-x" type="button" title="Cancelar" aria-label="Cancelar">✕</button>
-      </div>
-      <div class="bar"><div class="fill"></div></div>
-      <div class="task-sub">Iniciando…</div>
-    `;
-    const labelNode = node.querySelector('.task-label');
+
+    const top = document.createElement('div');
+    top.className = 'task-top';
+    const labelNode = document.createElement('span');
+    labelNode.className = 'task-label';
     labelNode.textContent = label;
     labelNode.title = filename || label;
+
+    const xBtn = document.createElement('button');
+    xBtn.className = 'task-x';
+    xBtn.type = 'button';
+    xBtn.title = 'Cancelar';
+    xBtn.setAttribute('aria-label', 'Cancelar');
+    xBtn.textContent = '✕';
+    top.append(labelNode, xBtn);
+
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const fillNode = document.createElement('div');
+    fillNode.className = 'fill';
+    bar.appendChild(fillNode);
+
+    const subNode = document.createElement('div');
+    subNode.className = 'task-sub';
+    subNode.textContent = 'Iniciando…';
+
+    node.append(top, bar, subNode);
 
     const task = {
       id: ++taskSeq,
       label,
       controller,
       node,
-      fill: node.querySelector('.fill'),
-      sub: node.querySelector('.task-sub'),
-      x: node.querySelector('.task-x'),
+      fill: fillNode,
+      sub: subNode,
+      x: xBtn,
       lastAt: 0,
       lastText: '',
       phase: '',
@@ -1145,12 +1228,26 @@
     return `${format.height}p${format.fps >= 50 ? ` ${format.fps}fps` : ''}`;
   }
 
+  function showStateMessage(text, withSpinner = false) {
+    const box = document.createElement('div');
+    box.className = 'state';
+    if (withSpinner) {
+      const sp = document.createElement('span');
+      sp.className = 'spinner';
+      box.appendChild(sp);
+    }
+    const span = document.createElement('span');
+    span.textContent = text;
+    box.appendChild(span);
+    el.body.replaceChildren(box);
+  }
+
   function renderVideo() {
     const rows = videoRows(state.formats.formats);
     const audioSource = audioCandidates(state.formats.formats)[0];
-    el.body.innerHTML = '';
+    el.body.replaceChildren();
     if (!rows.length) {
-      el.body.innerHTML = '<div class="state">Nenhum formato de vídeo disponível.</div>';
+      showStateMessage('Nenhum formato de vídeo disponível.');
       return;
     }
 
@@ -1228,10 +1325,10 @@
 
   function renderAudio() {
     const format = pickAudio(state.formats.formats);
-    el.body.innerHTML = '';
+    el.body.replaceChildren();
 
     if (!format) {
-      el.body.innerHTML = '<div class="state">Nenhum áudio disponível neste vídeo.</div>';
+      showStateMessage('Nenhum áudio disponível neste vídeo.');
       return;
     }
 
@@ -1302,11 +1399,11 @@
 
   function renderBody() {
     if (!state.videoId) {
-      el.body.innerHTML = '<div class="state">Abra um vídeo para listar os formatos disponíveis.</div>';
+      showStateMessage('Abra um vídeo para listar os formatos disponíveis.');
       return;
     }
     if (state.loading) {
-      el.body.innerHTML = '<div class="state"><span class="spinner"></span><span>Buscando formatos…</span></div>';
+      showStateMessage('Buscando formatos…', true);
       return;
     }
     if (state.error) {
@@ -1320,12 +1417,11 @@
       retry.textContent = 'Tentar novamente';
       retry.addEventListener('click', () => ensureFormats(state.videoId, true));
       box.append(message, retry);
-      el.body.innerHTML = '';
-      el.body.appendChild(box);
+      el.body.replaceChildren(box);
       return;
     }
     if (!state.formats) {
-      el.body.innerHTML = '';
+      el.body.replaceChildren();
       return;
     }
     if (state.tab === 'video') renderVideo();
@@ -1464,7 +1560,9 @@
   }
 
   document.addEventListener('yt-navigate-finish', sync);
+  document.addEventListener('yt-page-data-updated', sync);
   window.addEventListener('popstate', sync);
+  sync();
   setTimeout(sync, 300);
 
   console.info('[YouTube Downloader] Carregado. Botão disponível em páginas de vídeo.');
