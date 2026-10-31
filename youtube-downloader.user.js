@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Downloader — MP4 & MP3
 // @namespace    henrique.ytdownloader
-// @version      1.1.0
+// @version      1.2.0
 // @description  Baixa vídeos do YouTube em MP4 (todas as resoluções, com áudio montado no navegador) e extrai o áudio em MP3.
 // @author       Henrique
 // @match        https://www.youtube.com/*
@@ -94,6 +94,7 @@
 
   let taskSeq = 0;
   const tasks = new Map();
+  const busy = new Set();
 
   /* ------------------------------------------------------------------ *
    *  Utilidades
@@ -180,6 +181,12 @@
       #fab:active { transform: scale(.97); }
       #fab:focus-visible { outline: 2px solid #3ea6ff; outline-offset: 3px; }
       #fab[hidden] { display: none; }
+      #fab[data-busy]::after {
+        content: ''; position: absolute; top: -3px; right: -3px;
+        width: 14px; height: 14px; border-radius: 50%;
+        background: #2ecc71; border: 3px solid #101010;
+      }
+      #fab[data-err]::after { background: #ff8a8a; }
 
       #panel {
         position: fixed; right: 24px; bottom: 88px; z-index: 2147483000;
@@ -208,6 +215,7 @@
         background: transparent; color: #ccc; cursor: pointer; font-size: 16px; line-height: 1;
       }
       #close:hover { background: #272727; color: #fff; }
+      #close:focus-visible { outline: 2px solid #3ea6ff; outline-offset: 1px; }
 
       .tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid #272727; }
       .tab {
@@ -248,13 +256,14 @@
       .tag { padding: 1px 6px; border-radius: 4px; font-size: 10.5px; font-weight: 600; letter-spacing: .2px; }
       .tag.ok { background: rgba(46, 204, 113, .16); color: #5fe09a; }
       .tag.warn { background: rgba(255, 176, 32, .16); color: #ffc45e; }
+      .tag.muted { background: rgba(255, 255, 255, .09); color: #c9c9c9; }
 
       .primary {
-        border: 0; border-radius: 18px; background: #ff0033; color: #fff;
+        border: 0; border-radius: 18px; background: #e6002e; color: #fff;
         padding: 8px 16px; font: 600 12.5px Roboto, Arial, sans-serif;
         cursor: pointer; white-space: nowrap; transition: background .15s ease;
       }
-      .primary:hover { background: #e6002e; }
+      .primary:hover { background: #cc0029; }
       .primary:disabled { opacity: .5; cursor: default; }
       .primary.sm { padding: 7px 14px; }
 
@@ -264,6 +273,10 @@
         cursor: pointer; white-space: nowrap;
       }
       .ghost:hover { background: #1f1f1f; color: #fff; }
+      .ghost:disabled { opacity: .5; cursor: default; }
+      .tab:focus-visible, .primary:focus-visible, .ghost:focus-visible, .chip:focus-visible {
+        outline: 2px solid #3ea6ff; outline-offset: 2px;
+      }
       .row-actions { display: flex; flex-direction: column; align-items: stretch; gap: 4px; flex: 0 0 auto; }
       .ghost.sm { padding: 5px 10px; font-size: 11.5px; }
 
@@ -296,8 +309,12 @@
       .task { display: flex; flex-direction: column; gap: 5px; }
       .task-top { display: flex; align-items: center; gap: 8px; }
       .task-label { flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .task-x { border: 0; background: transparent; color: #888; cursor: pointer; font-size: 12px; padding: 0 2px; }
-      .task-x:hover { color: #fff; }
+      .task-x {
+        flex: 0 0 auto; border: 0; background: transparent; color: #888; cursor: pointer;
+        font-size: 12px; padding: 0 2px; min-width: 24px; min-height: 24px; border-radius: 6px;
+      }
+      .task-x:hover { color: #fff; background: #222; }
+      .task-x:focus-visible { outline: 2px solid #3ea6ff; outline-offset: 1px; }
       .bar { height: 4px; border-radius: 4px; background: #262626; overflow: hidden; }
       .fill { height: 100%; width: 0; border-radius: 4px; background: #ff0033; transition: width .15s linear; }
       .fill.indet { width: 35%; animation: indet 1.1s ease-in-out infinite; }
@@ -306,6 +323,13 @@
       .task.done .fill { background: #2ecc71; }
       .task.err .fill { background: #ff8a8a; }
       .task.err .task-sub { color: #ff8a8a; }
+      .task.cancel .fill { background: #555; }
+
+      @media (prefers-reduced-motion: reduce) {
+        .spinner, .fill.indet { animation-duration: 2.4s; }
+        #fab, .fill, .primary, .ghost { transition: none; }
+        #fab:hover, #fab:active { transform: none; }
+      }
 
       @media (max-width: 520px) {
         #panel { right: 8px; left: 8px; width: auto; bottom: 84px; max-height: 76vh; }
@@ -313,7 +337,7 @@
       }
     </style>
 
-    <button id="fab" type="button" title="Baixar vídeo" aria-label="Baixar vídeo" hidden>
+    <button id="fab" type="button" title="Baixar vídeo" aria-label="Baixar vídeo" aria-expanded="false" aria-controls="panel" hidden>
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <path d="M12 4v10m0 0 4-4m-4 4-4-4M5 19h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
@@ -327,12 +351,12 @@
         </div>
         <button id="close" type="button" title="Fechar" aria-label="Fechar">✕</button>
       </header>
-      <nav class="tabs">
-        <button class="tab active" data-tab="video" type="button">Vídeo (MP4)</button>
-        <button class="tab" data-tab="audio" type="button">Áudio (MP3)</button>
+      <nav class="tabs" role="tablist" aria-label="Tipo de download">
+        <button class="tab active" data-tab="video" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="body">Vídeo (MP4)</button>
+        <button class="tab" data-tab="audio" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="body">Áudio (MP3)</button>
       </nav>
-      <div id="body"></div>
-      <div id="tasks" hidden></div>
+      <div id="body" role="status" aria-live="polite"></div>
+      <div id="tasks" role="status" aria-live="polite" hidden></div>
     </section>
   `;
 
@@ -350,18 +374,31 @@
    *  Tarefas de download
    * ------------------------------------------------------------------ */
 
-  function createTask(label, controller) {
+  function syncTasks() {
+    el.tasks.hidden = tasks.size === 0;
+    const hasError = [...tasks.values()].some((t) => t.node.classList.contains('err'));
+    el.fab.toggleAttribute('data-busy', tasks.size > 0);
+    el.fab.toggleAttribute('data-err', hasError);
+    el.fab.hidden = !state.videoId && tasks.size === 0;
+    if (!state.videoId && tasks.size === 0 && state.open) {
+      closePanel();
+    }
+  }
+
+  function createTask(label, controller, filename) {
     const node = document.createElement('div');
     node.className = 'task';
     node.innerHTML = `
       <div class="task-top">
         <span class="task-label"></span>
-        <button class="task-x" type="button" aria-label="Cancelar">✕</button>
+        <button class="task-x" type="button" title="Cancelar" aria-label="Cancelar">✕</button>
       </div>
       <div class="bar"><div class="fill"></div></div>
       <div class="task-sub">Iniciando…</div>
     `;
-    node.querySelector('.task-label').textContent = label;
+    const labelNode = node.querySelector('.task-label');
+    labelNode.textContent = label;
+    labelNode.title = filename || label;
 
     const task = {
       id: ++taskSeq,
@@ -379,8 +416,7 @@
 
     task.x.addEventListener('click', () => {
       if (task.finished) {
-        node.remove();
-        tasks.delete(task.id);
+        removeTask(task);
         return;
       }
       controller.abort();
@@ -388,24 +424,26 @@
     });
 
     tasks.set(task.id, task);
-    el.tasks.hidden = false;
     el.tasks.appendChild(node);
+    syncTasks();
     while (tasks.size > 4) {
-      const oldest = [...tasks.values()].find((t) => t !== task && t.finished) || [...tasks.values()][0];
-      if (oldest === task) break;
+      // descarta apenas tarefas finalizadas; tarefas em andamento nunca são removidas
+      const oldest = [...tasks.values()].find((t) => t !== task && t.finished);
+      if (!oldest) break;
       removeTask(oldest);
     }
     return task;
   }
 
   function removeTask(task) {
+    if (!task.finished) task.controller.abort();
     task.node.remove();
     tasks.delete(task.id);
-    if (!tasks.size) el.tasks.hidden = true;
+    syncTasks();
   }
 
   function setProgress(task, phase, received, total) {
-    if (task.finished) return;
+    if (task.finished || task.controller.signal.aborted) return;
     const now = performance.now();
     const enoughTime = now - task.lastAt > 120;
     const pct = total > 0 ? Math.min(100, (received / total) * 100) : null;
@@ -425,7 +463,7 @@
   }
 
   function setPct(task, phase, fraction) {
-    if (task.finished) return;
+    if (task.finished || task.controller.signal.aborted) return;
     const pct = Math.max(0, Math.min(100, fraction * 100));
     task.fill.classList.remove('indet');
     task.fill.style.width = `${pct}%`;
@@ -439,17 +477,24 @@
     task.node.classList.add('done');
     task.sub.textContent = phase;
     task.x.textContent = '✕';
+    task.x.title = 'Remover';
+    task.x.setAttribute('aria-label', 'Remover');
+    syncTasks();
     setTimeout(() => removeTask(task), delay);
   }
 
   function failTask(task, error) {
     task.finished = true;
+    // AbortError = cancelamento pedido pelo usuário: estilo neutro, sem apagar a tarefa
+    const cancelled = error && error.name === 'AbortError';
     task.fill.classList.remove('indet');
     task.fill.style.width = '100%';
-    task.node.classList.add('err');
-    task.sub.textContent = error && error.name === 'AbortError' ? 'Cancelado' : (error.message || String(error));
+    task.node.classList.add(cancelled ? 'cancel' : 'err');
+    task.sub.textContent = cancelled ? 'Cancelado' : (error.message || String(error));
     task.x.textContent = '✕';
-    setTimeout(() => removeTask(task), 8000);
+    task.x.title = 'Remover';
+    task.x.setAttribute('aria-label', 'Remover');
+    syncTasks();
   }
 
   async function downloadToBlob(url, task, expectedSize, mime, phase = 'Baixando') {
@@ -764,13 +809,17 @@
     return context.startRendering();
   }
 
-  async function encodeMp3(buffer, kbps, onProgress) {
+  async function encodeMp3(buffer, kbps, signal, onProgress) {
     if (typeof lamejs === 'undefined') {
       throw new Error('O encoder MP3 não foi carregado. Verifique se o Tampermonkey conseguiu acessar o CDN.');
     }
+    if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
 
     let audio = buffer;
-    if (!MP3_RATES.includes(audio.sampleRate)) audio = await resampleBuffer(audio, 48000);
+    if (!MP3_RATES.includes(audio.sampleRate)) {
+      audio = await resampleBuffer(audio, 48000);
+      if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+    }
 
     const channels = Math.min(2, audio.numberOfChannels);
     const left = audio.getChannelData(0);
@@ -783,6 +832,7 @@
     const rightInt = new Int16Array(block);
 
     for (let offset = 0; offset < total; offset += block) {
+      if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
       const count = Math.min(block, total - offset);
       for (let i = 0; i < count; i++) {
         const l = Math.max(-1, Math.min(1, left[offset + i]));
@@ -800,10 +850,12 @@
 
       if ((offset / block) % 400 === 0) {
         await sleep(0);
+        if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
         onProgress(offset / total);
       }
     }
 
+    if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
     const tail = encoder.flush();
     if (tail.length) chunks.push(tail);
     onProgress(1);
@@ -909,11 +961,26 @@
    *  Ações
    * ------------------------------------------------------------------ */
 
+  function qualitySuffix(format) {
+    return `${format.qualityLabel}${format.fps > 30 ? ` ${format.fps}fps` : ''}`;
+  }
+
   async function startVideoDownload(format) {
+    const videoId = state.videoId;
+    const title = state.formats.title;
+    const key = `video:${videoId}:${format.itag}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+
     const controller = new AbortController();
+    const quality = qualitySuffix(format);
     const suffix = format.hasAudio ? '' : ' (sem áudio)';
-    const filename = `${sanitizeName(state.formats.title)} [${state.videoId}] - ${format.qualityLabel}${format.fps > 30 ? ` ${format.fps}fps` : ''}${suffix}.${format.container}`;
-    const task = createTask(filename, controller);
+    const filename = `${sanitizeName(title)} [${videoId}] - ${quality}${suffix}.${format.container}`;
+    const task = createTask(
+      `${quality} · ${format.container.toUpperCase()}${suffix} — ${title}`,
+      controller,
+      filename,
+    );
     console.info('[YouTube Downloader] Baixando:', format.itag, format.url.slice(0, 120));
 
     try {
@@ -923,6 +990,8 @@
     } catch (error) {
       console.warn('[YouTube Downloader]', error);
       failTask(task, error);
+    } finally {
+      busy.delete(key);
     }
   }
 
@@ -933,10 +1002,16 @@
       return;
     }
 
+    const videoId = state.videoId;
+    const title = state.formats.title;
+    const key = `merge:${videoId}:${format.itag}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+
     const controller = new AbortController();
-    const quality = `${format.qualityLabel}${format.fps > 30 ? ` ${format.fps}fps` : ''}`;
-    const filename = `${sanitizeName(state.formats.title)} [${state.videoId}] - ${quality}.mp4`;
-    const task = createTask(filename, controller);
+    const quality = qualitySuffix(format);
+    const filename = `${sanitizeName(title)} [${videoId}] - ${quality}.mp4`;
+    const task = createTask(`${quality} · MP4 — ${title}`, controller, filename);
 
     try {
       const videoBlob = await downloadToBlob(format.url, task, format.size, format.mime, 'Baixando vídeo');
@@ -952,13 +1027,21 @@
     } catch (error) {
       console.warn('[YouTube Downloader]', error);
       failTask(task, error);
+    } finally {
+      busy.delete(key);
     }
   }
 
   async function startAudioDownload(format) {
+    const videoId = state.videoId;
+    const title = state.formats.title;
+    const key = `audio:${videoId}:${format.itag}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+
     const controller = new AbortController();
-    const filename = `${sanitizeName(state.formats.title)} [${state.videoId}] - áudio.${format.container}`;
-    const task = createTask(filename, controller);
+    const filename = `${sanitizeName(title)} [${videoId}] - áudio.${format.container}`;
+    const task = createTask(`Áudio · ${format.container.toUpperCase()} — ${title}`, controller, filename);
 
     try {
       const blob = await downloadToBlob(format.url, task, format.size, format.mime);
@@ -966,6 +1049,8 @@
       saveBlob(blob, filename);
     } catch (error) {
       failTask(task, error);
+    } finally {
+      busy.delete(key);
     }
   }
 
@@ -973,40 +1058,72 @@
     const candidates = audioCandidates(state.formats.formats);
     if (!candidates.length) return;
 
+    const videoId = state.videoId;
+    const title = state.formats.title;
+    const key = `mp3:${videoId}:${kbps}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+
     const controller = new AbortController();
-    const filename = `${sanitizeName(state.formats.title)} [${state.videoId}] - ${kbps}kbps.mp3`;
-    const task = createTask(filename, controller);
+    const filename = `${sanitizeName(title)} [${videoId}] - ${kbps}kbps.mp3`;
+    const task = createTask(`${kbps} kbps · MP3 — ${title}`, controller, filename);
 
     try {
       let audioBuffer = null;
       let lastError = null;
 
       for (const candidate of candidates) {
+        if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
         const source = await downloadToBlob(candidate.url, task, candidate.size, candidate.mime);
+        if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
         try {
           setPct(task, 'Decodificando áudio', 0);
           audioBuffer = await decodeAudio(source);
           break;
         } catch (error) {
+          if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
           lastError = error;
           console.warn('[YouTube Downloader] Falha ao decodificar', candidate.mime, error);
         }
       }
 
+      if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
       if (!audioBuffer) throw lastError || new Error('Não foi possível decodificar o áudio.');
 
-      const mp3 = await encodeMp3(audioBuffer, kbps, (fraction) => setPct(task, 'Convertendo para MP3', fraction));
+      const mp3 = await encodeMp3(audioBuffer, kbps, task.controller.signal, (fraction) => {
+        if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+        setPct(task, 'Convertendo para MP3', fraction);
+      });
       finishTask(task, `Salvo em MP3 (${kbps} kbps)`);
       saveBlob(mp3, filename);
     } catch (error) {
       console.warn('[YouTube Downloader]', error);
       failTask(task, error);
+    } finally {
+      busy.delete(key);
     }
   }
 
   /* ------------------------------------------------------------------ *
    *  Renderização
    * ------------------------------------------------------------------ */
+
+  function wireTaskButton(button, keyOrFn, idleText, go) {
+    const key = () => (typeof keyOrFn === 'function' ? keyOrFn() : keyOrFn);
+    const refresh = () => {
+      const active = busy.has(key());
+      button.disabled = active;
+      button.textContent = active ? 'Baixando…' : idleText;
+    };
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      const promise = go();
+      refresh();
+      if (promise) Promise.resolve(promise).finally(refresh);
+    });
+    refresh();
+    return refresh;
+  }
 
   function videoRows(formats) {
     const byHeight = new Map();
@@ -1030,6 +1147,7 @@
 
   function renderVideo() {
     const rows = videoRows(state.formats.formats);
+    const audioSource = audioCandidates(state.formats.formats)[0];
     el.body.innerHTML = '';
     if (!rows.length) {
       el.body.innerHTML = '<div class="state">Nenhum formato de vídeo disponível.</div>';
@@ -1039,7 +1157,7 @@
     if (rows.some((row) => !row.hasAudio)) {
       const note = document.createElement('div');
       note.className = 'note';
-      note.textContent = 'Acima de 720p o YouTube entrega vídeo e áudio em faixas separadas. Em "MP4 com áudio", as duas faixas são baixadas e unidas aqui no navegador, sem perder qualidade.';
+      note.textContent = 'Algumas resoluções vêm com vídeo e áudio separados. Em “Baixar MP4”, as duas faixas são baixadas e unidas aqui no navegador, sem perder qualidade.';
       el.body.appendChild(note);
     }
 
@@ -1062,22 +1180,28 @@
       sub.append(document.createTextNode(`${format.container.toUpperCase()} · ${codecName(format.codec)} · `));
 
       const tag = document.createElement('span');
-      tag.className = format.hasAudio ? 'tag ok' : 'tag warn';
-      tag.textContent = format.hasAudio ? 'com áudio' : 'sem áudio';
+      tag.className = format.hasAudio ? 'tag ok' : 'tag muted';
+      tag.textContent = format.hasAudio ? 'com áudio' : 'áudio separado';
       sub.append(tag);
 
-      if (format.size) sub.append(document.createTextNode(` · ${fmtBytes(format.size)}`));
+      if (format.size) {
+        const plus = !format.hasAudio && audioSource
+          ? (audioSource.size ? ` + ${fmtBytes(audioSource.size)}` : ' + áudio')
+          : '';
+        sub.append(document.createTextNode(` · ${fmtBytes(format.size)}${plus}`));
+      }
 
       meta.append(quality, sub);
 
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'primary sm';
-      button.textContent = format.hasAudio ? 'Baixar' : 'MP4 com áudio';
-      button.addEventListener('click', () => {
-        if (format.hasAudio) startVideoDownload(format);
-        else startMergedDownload(format);
-      });
+      wireTaskButton(
+        button,
+        format.hasAudio ? `video:${state.videoId}:${format.itag}` : `merge:${state.videoId}:${format.itag}`,
+        format.hasAudio ? 'Baixar' : 'Baixar MP4',
+        () => (format.hasAudio ? startVideoDownload(format) : startMergedDownload(format)),
+      );
 
       const actions = document.createElement('div');
       actions.className = 'row-actions';
@@ -1087,8 +1211,7 @@
         const solo = document.createElement('button');
         solo.type = 'button';
         solo.className = 'ghost sm';
-        solo.textContent = 'só vídeo';
-        solo.addEventListener('click', () => startVideoDownload(format));
+        wireTaskButton(solo, `video:${state.videoId}:${format.itag}`, 'Baixar sem áudio', () => startVideoDownload(format));
         actions.appendChild(solo);
       }
 
@@ -1126,21 +1249,8 @@
     bitrateLabel.textContent = 'Qualidade do MP3';
     const chips = document.createElement('div');
     chips.className = 'chips';
-
-    for (const kbps of [128, 192, 320]) {
-      const chip = document.createElement('button');
-      chip.type = 'button';
-      chip.className = `chip${state.kbps === kbps ? ' active' : ''}`;
-      chip.textContent = `${kbps} kbps`;
-      chip.addEventListener('click', () => {
-        state.kbps = kbps;
-        chips.querySelectorAll('.chip').forEach((el) => el.classList.remove('active'));
-        chip.classList.add('active');
-      });
-      chips.appendChild(chip);
-    }
-
-    bitrateField.append(bitrateLabel, chips);
+    chips.setAttribute('role', 'group');
+    chips.setAttribute('aria-label', 'Qualidade do MP3');
 
     const actions = document.createElement('div');
     actions.className = 'actions';
@@ -1148,15 +1258,43 @@
     const mp3Button = document.createElement('button');
     mp3Button.type = 'button';
     mp3Button.className = 'primary';
-    mp3Button.textContent = 'Baixar MP3';
-    mp3Button.addEventListener('click', () => startMp3Download(state.kbps));
+    const refreshMp3Button = wireTaskButton(
+      mp3Button,
+      () => `mp3:${state.videoId}:${state.kbps}`,
+      'Baixar MP3',
+      () => startMp3Download(state.kbps),
+    );
 
     const rawButton = document.createElement('button');
     rawButton.type = 'button';
     rawButton.className = 'ghost';
-    rawButton.textContent = `Baixar áudio original (.${format.container})`;
-    rawButton.addEventListener('click', () => startAudioDownload(format));
+    wireTaskButton(
+      rawButton,
+      `audio:${state.videoId}:${format.itag}`,
+      `Baixar áudio original (.${format.container})`,
+      () => startAudioDownload(format),
+    );
 
+    for (const kbps of [128, 192, 320]) {
+      const active = state.kbps === kbps;
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = `chip${active ? ' active' : ''}`;
+      chip.setAttribute('aria-pressed', String(active));
+      chip.textContent = `${kbps} kbps`;
+      chip.addEventListener('click', () => {
+        state.kbps = kbps;
+        for (const other of chips.querySelectorAll('.chip')) {
+          const isCurrent = other === chip;
+          other.classList.toggle('active', isCurrent);
+          other.setAttribute('aria-pressed', String(isCurrent));
+        }
+        refreshMp3Button();
+      });
+      chips.appendChild(chip);
+    }
+
+    bitrateField.append(bitrateLabel, chips);
     actions.append(mp3Button, rawButton);
     card.append(sourceInfo, bitrateField, actions);
     el.body.appendChild(card);
@@ -1164,7 +1302,7 @@
 
   function renderBody() {
     if (!state.videoId) {
-      el.body.innerHTML = '';
+      el.body.innerHTML = '<div class="state">Abra um vídeo para listar os formatos disponíveis.</div>';
       return;
     }
     if (state.loading) {
@@ -1231,17 +1369,24 @@
   }
 
   function openPanel() {
-    if (!state.videoId) return;
+    if (!state.videoId && tasks.size === 0) return;
     state.open = true;
     el.panel.hidden = false;
-    el.title.textContent = videoTitle();
+    el.fab.setAttribute('aria-expanded', 'true');
+    el.title.textContent = state.videoId
+      ? (state.formats ? state.formats.title : videoTitle())
+      : 'Downloads em andamento';
     renderBody();
-    if (!state.formats && !state.loading) ensureFormats(state.videoId);
+    if (state.videoId && !state.formats && !state.loading) ensureFormats(state.videoId);
   }
 
   function closePanel() {
+    if (!state.open) return;
+    const hadFocus = el.panel.contains(root.activeElement);
     state.open = false;
     el.panel.hidden = true;
+    el.fab.setAttribute('aria-expanded', 'false');
+    if (hadFocus && !el.fab.hidden) el.fab.focus();
   }
 
   /* ------------------------------------------------------------------ *
@@ -1257,26 +1402,52 @@
 
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && state.open) {
-      event.stopPropagation();
+      if (el.panel.contains(root.activeElement)) {
+        event.stopPropagation();
+      }
       closePanel();
     }
   }, true);
 
-  for (const tab of el.tabs) {
-    tab.addEventListener('click', () => {
-      state.tab = tab.dataset.tab;
-      for (const other of el.tabs) other.classList.toggle('active', other === tab);
-      renderBody();
+  function selectTab(tab, focus = false) {
+    state.tab = tab.dataset.tab;
+    for (const other of el.tabs) {
+      const active = other === tab;
+      other.classList.toggle('active', active);
+      other.setAttribute('aria-selected', String(active));
+      other.tabIndex = active ? 0 : -1;
+    }
+    if (focus) tab.focus();
+    renderBody();
+  }
+
+  for (const [index, tab] of el.tabs.entries()) {
+    tab.addEventListener('click', () => selectTab(tab));
+    tab.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+        event.preventDefault();
+        const dir = event.key === 'ArrowRight' ? 1 : -1;
+        const next = el.tabs[(index + dir + el.tabs.length) % el.tabs.length];
+        selectTab(next, true);
+      }
     });
   }
 
   function sync() {
     const id = currentVideoId();
-    el.fab.hidden = !id;
+    el.fab.hidden = !id && tasks.size === 0;
 
     if (!id) {
-      closePanel();
       state.videoId = null;
+      state.formats = null;
+      state.error = null;
+      state.loading = false;
+      if (tasks.size === 0) {
+        closePanel();
+      } else if (state.open) {
+        el.title.textContent = 'Downloads em andamento';
+        renderBody();
+      }
       return;
     }
 
