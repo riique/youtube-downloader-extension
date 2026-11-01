@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Downloader — MP4 & MP3
 // @namespace    henrique.ytdownloader
-// @version      1.1.0
-// @description  Baixa vídeos do YouTube em MP4 (todas as resoluções, com áudio montado no navegador) e extrai o áudio em MP3.
+// @version      1.4.0
+// @description  Baixa vídeos do YouTube em MP4 (todas as resoluções, download paralelo acelerado e áudio montado no navegador) e extrai áudio em MP3.
 // @author       Henrique
 // @match        https://www.youtube.com/*
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%23ff0033'/%3E%3Cpath d='M12 6v7m0 0 3-3m-3 3-3-3M7 17h10' stroke='%23fff' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E
@@ -22,53 +22,49 @@
    * ------------------------------------------------------------------ */
 
   const API_URL = '/youtubei/v1/player?prettyPrint=false';
+  const SW_DATA_URL = '/sw.js_data';
+  const SVG_NS = 'http://www.w3.org/2000/svg';
   const MP3_RATES = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000];
+  const RANGE_CHUNK_BYTES = 4 * 1024 * 1024;
+  const RANGE_CONCURRENCY = 6;
+  const PAGE_PRIORITY = 8;
+  const CIPHER_PRIORITY = 9;
 
   const CLIENTS = [
     {
+      name: 'VISIONOS',
+      clientId: 101,
+      payload: {
+        context: {
+          client: {
+            clientName: 'VISIONOS',
+            clientVersion: '1.02',
+            deviceMake: 'Apple',
+            deviceModel: 'RealityDevice17,1',
+            osName: 'visionOS',
+            osVersion: '26.5.23O471',
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
+            hl: 'pt-BR',
+            gl: 'BR',
+          },
+        },
+      },
+    },
+    {
       name: 'ANDROID_VR',
+      clientId: 28,
+      limitedSeconds: 50,
       payload: {
         context: {
           client: {
             clientName: 'ANDROID_VR',
-            clientVersion: '1.62.27',
+            clientVersion: '1.65.10',
             deviceMake: 'Oculus',
             deviceModel: 'Quest 3',
             androidSdkVersion: 32,
             osName: 'Android',
-            osVersion: '12',
-            userAgent: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; GB) gzip',
-            hl: 'pt-BR',
-            gl: 'BR',
-          },
-        },
-      },
-    },
-    {
-      name: 'IOS',
-      payload: {
-        context: {
-          client: {
-            clientName: 'IOS',
-            clientVersion: '19.49.2',
-            deviceMake: 'Apple',
-            deviceModel: 'iPhone16,2',
-            osName: 'iPhone',
-            osVersion: '18.2.0.22C152',
-            userAgent: 'com.google.ios.youtube/19.49.2 (iPhone16,2; U; CPU iOS 18_2_0 like Mac OS X;)',
-            hl: 'pt-BR',
-            gl: 'BR',
-          },
-        },
-      },
-    },
-    {
-      name: 'WEB',
-      payload: {
-        context: {
-          client: {
-            clientName: 'WEB',
-            clientVersion: '2.20250101.01.00',
+            osVersion: '12L',
+            userAgent: 'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
             hl: 'pt-BR',
             gl: 'BR',
           },
@@ -89,11 +85,14 @@
     formats: null,
     tab: 'video',
     kbps: 192,
+    startAt: 0,
     cache: new Map(),
   };
 
   let taskSeq = 0;
   const tasks = new Map();
+  const busy = new Set();
+  const inflightFormats = new Map();
 
   /* ------------------------------------------------------------------ *
    *  Utilidades
@@ -101,12 +100,60 @@
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  const yieldThread = (() => {
+    if (typeof MessageChannel === 'function') {
+      const channel = new MessageChannel();
+      const queue = [];
+      channel.port1.onmessage = () => {
+        const next = queue.shift();
+        if (next) next();
+      };
+      return () => new Promise((resolve) => {
+        queue.push(resolve);
+        channel.port2.postMessage(0);
+      });
+    }
+    return () => sleep(0);
+  })();
+
   function fmtBytes(bytes) {
-    if (!bytes) return '0 B';
+    if (!bytes || bytes <= 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB'];
     const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
     const value = bytes / Math.pow(1024, i);
     return `${value.toFixed(value >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+  }
+
+  function fmtDuration(totalSeconds) {
+    const sec = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+    if (!sec) return '';
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+  }
+
+  // Aceita "6", "6.5", "1:23" ou "1:02:03". Retorna null se inválido.
+  function parseTimecode(text) {
+    const raw = String(text || '').trim().replace(',', '.');
+    if (!raw) return 0;
+    if (!/^\d+(\.\d+)?$|^\d+(:[0-5]?\d){1,2}(\.\d+)?$/.test(raw)) return null;
+    return raw.split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
+  }
+
+  function fmtTimecode(totalSeconds) {
+    const sec = Math.max(0, Number(totalSeconds) || 0);
+    const whole = Math.floor(sec);
+    const frac = sec - whole >= 0.05 ? `.${Math.round((sec - whole) * 10) % 10}` : '';
+    return `${fmtDuration(whole) || '0:00'}${frac}`;
+  }
+
+  function startSuffix(start) {
+    if (!(start > 0)) return '';
+    const parts = fmtTimecode(start).split(':');
+    const units = parts.length === 3 ? ['h', 'm', 's'] : ['m', 's'];
+    return ` (a partir de ${parts.map((part, i) => part + units[i]).join('')})`;
   }
 
   function sanitizeName(value) {
@@ -140,7 +187,16 @@
   }
 
   function videoTitle() {
-    return document.title.replace(/\s*[-–]\s*YouTube\s*$/, '').trim();
+    const heading = document.querySelector('ytd-watch-metadata h1 yt-formatted-string');
+    if (heading && heading.textContent && heading.textContent.trim()) {
+      return heading.textContent.trim();
+    }
+    return document.title.replace(/^\(\d+\)\s*/, '').replace(/\s*[-–]\s*YouTube\s*$/, '').trim();
+  }
+
+  function videoAuthor() {
+    const channel = document.querySelector('ytd-watch-metadata #channel-name a, ytd-watch-metadata ytd-channel-name yt-formatted-string');
+    return channel && channel.textContent ? channel.textContent.trim() : '';
   }
 
   function saveBlob(blob, filename) {
@@ -155,8 +211,116 @@
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
+  function createIcon(paths, size = 20, strokeWidth = 1.9) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('width', String(size));
+    svg.setAttribute('height', String(size));
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('aria-hidden', 'true');
+    const list = Array.isArray(paths) ? paths : [paths];
+    for (const d of list) {
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('d', d);
+      path.setAttribute('stroke', 'currentColor');
+      path.setAttribute('stroke-width', String(strokeWidth));
+      path.setAttribute('stroke-linecap', 'round');
+      path.setAttribute('stroke-linejoin', 'round');
+      svg.appendChild(path);
+    }
+    return svg;
+  }
+
+  const ICON_DOWNLOAD = 'M12 4v10.5m0 0 4-4m-4 4-4-4M5 19h14';
+  const ICON_ARROW_DOWN = 'M12 5v11m0 0 4-4m-4 4-4-4';
+  const ICON_CLOSE = 'M6.5 6.5l11 11M17.5 6.5l-11 11';
+  const ICON_VIDEO = [
+    'M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5v-11Z',
+    'M10 9.25v5.5L15 12l-5-2.75Z',
+  ];
+  const ICON_AUDIO = [
+    'M9 17.5V6.5l9-2v11',
+    'M9 17.5a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0Z',
+    'M18 15.5a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0Z',
+  ];
+  const ICON_MUTE = [
+    'M11 5.5 6.8 9H4a1 1 0 0 0-1 1v4a1 1 0 0 0 1 1h2.8L11 18.5v-13Z',
+    'M16 9.5l5 5M21 9.5l-5 5',
+  ];
+
   /* ------------------------------------------------------------------ *
-   *  Interface
+   *  Botão integrado na barra de ações (ao lado de Compartilhar)
+   * ------------------------------------------------------------------ */
+
+  const inlineHost = document.createElement('div');
+  inlineHost.id = 'yt-downloader-inline-host';
+  inlineHost.style.cssText = 'display:inline-flex;align-items:center;flex:0 0 auto;vertical-align:middle;';
+  const inlineRoot = inlineHost.attachShadow({ mode: 'open' });
+
+  const inlineStyle = document.createElement('style');
+  inlineStyle.textContent = `
+    :host { all: initial; display: inline-flex; align-items: center; }
+    *, *::before, *::after { box-sizing: border-box; }
+
+    #inline-btn {
+      position: relative;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      height: 36px; padding: 0 16px 0 12px; border: 0; border-radius: 18px;
+      background: rgba(255, 255, 255, 0.1); color: #f1f1f1;
+      font: 500 14px/36px Roboto, "YouTube Sans", Arial, sans-serif;
+      letter-spacing: 0.01em; white-space: nowrap; cursor: pointer;
+      user-select: none; -webkit-tap-highlight-color: transparent;
+      transition: background-color .16s cubic-bezier(0.2, 0, 0, 1);
+    }
+    #inline-btn:hover { background: rgba(255, 255, 255, 0.2); }
+    #inline-btn:active { background: rgba(255, 255, 255, 0.26); }
+    #inline-btn[aria-expanded="true"] { background: rgba(255, 255, 255, 0.22); }
+    #inline-btn:focus-visible { outline: 2px solid #3ea6ff; outline-offset: -2px; }
+
+    :host([data-light]) #inline-btn {
+      background: rgba(0, 0, 0, 0.05); color: #0f0f0f;
+    }
+    :host([data-light]) #inline-btn:hover { background: rgba(0, 0, 0, 0.1); }
+    :host([data-light]) #inline-btn:active { background: rgba(0, 0, 0, 0.15); }
+    :host([data-light]) #inline-btn[aria-expanded="true"] { background: rgba(0, 0, 0, 0.13); }
+
+    #inline-btn svg { flex: 0 0 auto; display: block; }
+
+    .badge {
+      display: inline-flex; align-items: center; justify-content: center;
+      min-width: 18px; height: 18px; padding: 0 5px; margin-right: -4px; border-radius: 9px;
+      background: #e6002e; color: #ffffff;
+      font: 700 11px/1 Roboto, Arial, sans-serif;
+      font-variant-numeric: tabular-nums;
+    }
+    .badge[hidden] { display: none; }
+    #inline-btn[data-err] .badge { background: #dc2626; color: #ffffff; }
+
+    @media (prefers-reduced-motion: reduce) {
+      #inline-btn { transition: none; }
+    }
+  `;
+
+  const inlineBtn = document.createElement('button');
+  inlineBtn.id = 'inline-btn';
+  inlineBtn.type = 'button';
+  inlineBtn.title = 'Baixar vídeo ou áudio';
+  inlineBtn.setAttribute('aria-label', 'Baixar vídeo ou áudio');
+  inlineBtn.setAttribute('aria-haspopup', 'dialog');
+  inlineBtn.setAttribute('aria-expanded', 'false');
+
+  const inlineLabel = document.createElement('span');
+  inlineLabel.textContent = 'Baixar';
+
+  const inlineBadge = document.createElement('span');
+  inlineBadge.className = 'badge';
+  inlineBadge.hidden = true;
+
+  inlineBtn.append(createIcon(ICON_DOWNLOAD, 20, 1.9), inlineLabel, inlineBadge);
+  inlineRoot.append(inlineStyle, inlineBtn);
+
+  /* ------------------------------------------------------------------ *
+   *  Painel e botão flutuante de reserva (Shorts / fora do watch)
    * ------------------------------------------------------------------ */
 
   const host = document.createElement('div');
@@ -164,223 +328,749 @@
   document.documentElement.appendChild(host);
   const root = host.attachShadow({ mode: 'open' });
 
-  root.innerHTML = `
-    <style>
-      :host { all: initial; }
-      *, *::before, *::after { box-sizing: border-box; }
+  const styleEl = document.createElement('style');
+  styleEl.textContent = `
+    :host {
+      all: initial;
+      --bg-panel: #16161a;
+      --bg-elevated: #202026;
+      --bg-hover: #24242c;
+      --bg-active: #2e2e38;
+      --bg-tray: #111115;
+      --line: rgba(255, 255, 255, 0.08);
+      --line-strong: rgba(255, 255, 255, 0.16);
+      --ink: #f4f4f6;
+      --ink-2: #a1a1aa;
+      --ink-3: #8c8c96;
+      --accent: #e6002e;
+      --accent-hover: #c80028;
+      --accent-soft: rgba(255, 46, 86, 0.16);
+      --accent-ink: #ff8fa3;
+      --ok: #22c55e;
+      --err: #ff6b6b;
+      --err-ink: #ff8f8f;
+      --shadow-panel: 0 22px 52px -10px rgba(0, 0, 0, 0.74), 0 6px 18px rgba(0, 0, 0, 0.42);
+      --shadow-seg: 0 1px 3px rgba(0, 0, 0, 0.36);
+      --scroll-thumb: rgba(255, 255, 255, 0.2);
+    }
 
-      #fab {
-        position: fixed; right: 24px; bottom: 24px; z-index: 2147483000;
-        width: 52px; height: 52px; border: 0; border-radius: 50%;
-        background: #ff0033; color: #fff; display: grid; place-items: center;
-        cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,.45);
-        transition: transform .15s ease, filter .15s ease;
-      }
-      #fab:hover { transform: scale(1.07); filter: brightness(1.08); }
-      #fab:active { transform: scale(.97); }
-      #fab:focus-visible { outline: 2px solid #3ea6ff; outline-offset: 3px; }
-      #fab[hidden] { display: none; }
+    :host([data-light]) {
+      --bg-panel: #ffffff;
+      --bg-elevated: #f3f3f6;
+      --bg-hover: #f1f1f5;
+      --bg-active: #ffffff;
+      --bg-tray: #f7f7fa;
+      --line: rgba(15, 15, 20, 0.08);
+      --line-strong: rgba(15, 15, 20, 0.15);
+      --ink: #0f0f13;
+      --ink-2: #52525b;
+      --ink-3: #686873;
+      --accent: #e6002e;
+      --accent-hover: #be0026;
+      --accent-soft: rgba(230, 0, 46, 0.09);
+      --accent-ink: #b80024;
+      --ok: #16a34a;
+      --err: #dc2626;
+      --err-ink: #b91c1c;
+      --shadow-panel: 0 20px 48px -10px rgba(15, 15, 20, 0.22), 0 4px 14px rgba(15, 15, 20, 0.08);
+      --shadow-seg: 0 1px 3px rgba(15, 15, 20, 0.1);
+      --scroll-thumb: rgba(15, 15, 20, 0.2);
+    }
 
-      #panel {
-        position: fixed; right: 24px; bottom: 88px; z-index: 2147483000;
-        width: 404px; max-width: calc(100vw - 32px);
-        max-height: min(74vh, 640px);
-        display: flex; flex-direction: column; overflow: hidden;
-        background: #0f0f0f; color: #f1f1f1;
-        border: 1px solid #303030; border-radius: 14px;
-        box-shadow: 0 24px 64px rgba(0,0,0,.65);
-        font: 14px/1.45 Roboto, Arial, sans-serif;
-      }
-      #panel[hidden] { display: none; }
+    *, *::before, *::after { box-sizing: border-box; }
+    ::selection { background: rgba(230, 0, 46, 0.3); color: #ffffff; }
 
-      header {
-        display: flex; align-items: flex-start; gap: 12px;
-        padding: 14px 14px 10px; border-bottom: 1px solid #272727;
-      }
-      .hdr-text { flex: 1 1 auto; min-width: 0; }
-      .hdr-title { font-size: 15px; font-weight: 600; letter-spacing: .1px; }
-      .hdr-sub {
-        margin-top: 2px; font-size: 12px; color: #aaa;
-        display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-      }
-      #close {
-        flex: 0 0 auto; width: 30px; height: 30px; border: 0; border-radius: 50%;
-        background: transparent; color: #ccc; cursor: pointer; font-size: 16px; line-height: 1;
-      }
-      #close:hover { background: #272727; color: #fff; }
+    #fab {
+      position: fixed; right: 24px; bottom: 24px; z-index: 2147483000;
+      width: 48px; height: 48px; border: 0; border-radius: 50%;
+      background: var(--accent); color: #ffffff; display: grid; place-items: center;
+      cursor: pointer; box-shadow: 0 10px 26px rgba(0, 0, 0, 0.44);
+      transition: background-color .16s ease, transform .16s cubic-bezier(0.2, 0, 0, 1);
+    }
+    #fab:hover { background: var(--accent-hover); transform: scale(1.05); }
+    #fab:active { transform: scale(0.97); }
+    #fab:focus-visible { outline: 2px solid #3ea6ff; outline-offset: 3px; }
+    #fab[hidden] { display: none; }
+    #fab[data-busy]::after {
+      content: ''; position: absolute; top: -2px; right: -2px;
+      width: 13px; height: 13px; border-radius: 50%;
+      background: var(--ok); border: 2.5px solid var(--bg-panel);
+    }
+    #fab[data-err]::after { background: var(--err); }
 
-      .tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid #272727; }
-      .tab {
-        position: relative; flex: 1 1 0; padding: 8px 6px 10px;
-        border: 0; background: transparent; color: #aaa; cursor: pointer;
-        font: 500 13px Roboto, Arial, sans-serif;
-      }
-      .tab:hover { color: #fff; }
-      .tab.active { color: #fff; }
-      .tab.active::after {
-        content: ''; position: absolute; left: 12%; right: 12%; bottom: -1px;
-        height: 2px; border-radius: 2px; background: #ff0033;
-      }
+    #panel {
+      position: fixed; right: 24px; bottom: 84px; z-index: 2147483000;
+      width: 416px; max-width: calc(100vw - 24px);
+      max-height: min(76vh, 620px);
+      display: flex; flex-direction: column; overflow: hidden;
+      background: var(--bg-panel); color: var(--ink);
+      border-radius: 16px;
+      box-shadow: var(--shadow-panel);
+      font: 14px/1.42 Roboto, "YouTube Sans", Arial, sans-serif;
+      font-variant-numeric: tabular-nums;
+      transform-origin: top left;
+      animation: panel-in .16s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    #panel[hidden] { display: none; }
+    @keyframes panel-in {
+      from { opacity: 0; transform: translateY(-6px) scale(0.985); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
 
-      #body { flex: 1 1 auto; overflow-y: auto; padding: 12px; }
-      #body::-webkit-scrollbar { width: 8px; }
-      #body::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 8px; }
+    header {
+      display: flex; align-items: center; gap: 12px;
+      padding: 13px 14px 12px;
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--line);
+    }
 
-      .state { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 26px 8px; color: #bbb; text-align: center; }
-      .state.err { color: #ff8a8a; }
-      .spinner {
-        width: 26px; height: 26px; border-radius: 50%;
-        border: 3px solid #333; border-top-color: #ff0033;
-        animation: spin .8s linear infinite;
-      }
-      @keyframes spin { to { transform: rotate(360deg); } }
+    .thumb-wrap {
+      position: relative; flex: 0 0 76px; width: 76px; height: 43px;
+      border-radius: 8px; overflow: hidden;
+      background: var(--bg-hover);
+    }
+    .thumb-wrap[hidden] { display: none; }
+    .thumb {
+      display: block; width: 100%; height: 100%; object-fit: cover;
+    }
+    .dur {
+      position: absolute; right: 4px; bottom: 3px;
+      padding: 1px 4px; border-radius: 4px;
+      background: rgba(0, 0, 0, 0.82); color: #ffffff;
+      font: 600 10px/1.25 Roboto, Arial, sans-serif;
+      letter-spacing: 0.01em;
+    }
+    .dur[hidden] { display: none; }
 
-      .list { display: flex; flex-direction: column; gap: 4px; }
-      .row {
-        display: flex; align-items: center; gap: 12px;
-        padding: 9px 10px; border-radius: 10px;
-      }
-      .row:hover { background: #1c1c1c; }
-      .row .meta { flex: 1 1 auto; min-width: 0; }
-      .q { font-size: 15px; font-weight: 600; }
-      .sub { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 2px; font-size: 11.5px; color: #aaa; }
+    .hdr-text { flex: 1 1 auto; min-width: 0; }
+    .hdr-title {
+      font-size: 13.5px; font-weight: 600; line-height: 1.3; letter-spacing: -0.01em;
+      color: var(--ink);
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .hdr-sub {
+      margin-top: 2px; font-size: 11.5px; color: var(--ink-2);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .hdr-sub:empty { display: none; }
 
-      .tag { padding: 1px 6px; border-radius: 4px; font-size: 10.5px; font-weight: 600; letter-spacing: .2px; }
-      .tag.ok { background: rgba(46, 204, 113, .16); color: #5fe09a; }
-      .tag.warn { background: rgba(255, 176, 32, .16); color: #ffc45e; }
+    #close {
+      flex: 0 0 auto; width: 32px; height: 32px; border: 0; border-radius: 50%;
+      background: transparent; color: var(--ink-2); cursor: pointer;
+      display: grid; place-items: center; margin-right: -4px;
+      transition: background-color .15s ease, color .15s ease;
+    }
+    #close:hover { background: var(--line); color: var(--ink); }
+    #close:focus-visible { outline: 2px solid #3ea6ff; outline-offset: 1px; }
 
-      .primary {
-        border: 0; border-radius: 18px; background: #ff0033; color: #fff;
-        padding: 8px 16px; font: 600 12.5px Roboto, Arial, sans-serif;
-        cursor: pointer; white-space: nowrap; transition: background .15s ease;
-      }
-      .primary:hover { background: #e6002e; }
-      .primary:disabled { opacity: .5; cursor: default; }
-      .primary.sm { padding: 7px 14px; }
+    .tabs-wrap { padding: 10px 14px 4px; }
+    .tabs {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 3px;
+      padding: 3px; border-radius: 11px;
+      background: var(--bg-elevated);
+    }
+    .tab {
+      height: 33px; padding: 0 10px; border: 0; border-radius: 8px;
+      background: transparent; color: var(--ink-2); cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      font: 600 12.5px/1 Roboto, Arial, sans-serif;
+      transition: background-color .15s ease, color .15s ease;
+    }
+    .tab:hover { color: var(--ink); }
+    .tab.active {
+      background: var(--bg-active); color: var(--ink);
+      box-shadow: var(--shadow-seg);
+    }
+    .tab.active svg { color: var(--accent-ink); }
 
-      .ghost {
-        border: 1px solid #3a3a3a; border-radius: 18px; background: transparent;
-        color: #ddd; padding: 8px 14px; font: 500 12.5px Roboto, Arial, sans-serif;
-        cursor: pointer; white-space: nowrap;
-      }
-      .ghost:hover { background: #1f1f1f; color: #fff; }
-      .row-actions { display: flex; flex-direction: column; align-items: stretch; gap: 4px; flex: 0 0 auto; }
-      .ghost.sm { padding: 5px 10px; font-size: 11.5px; }
+    #body {
+      flex: 1 1 auto; overflow-y: auto; padding: 8px 10px 12px;
+      scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent;
+    }
+    #body::-webkit-scrollbar { width: 7px; }
+    #body::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 8px; }
 
-      .note {
-        margin: 0 2px 10px; padding: 9px 10px; border-radius: 8px;
-        background: rgba(255, 176, 32, .08); border: 1px solid rgba(255, 176, 32, .22);
-        color: #e9c98a; font-size: 11.5px; line-height: 1.45;
-      }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
 
-      .audio-card { display: flex; flex-direction: column; gap: 14px; padding: 4px 2px; }
-      .field-label { font-size: 11px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; color: #888; }
-      .chips { display: flex; gap: 8px; margin-top: 8px; }
-      .chip {
-        flex: 1 1 0; padding: 8px 0; border-radius: 8px; cursor: pointer;
-        background: #1c1c1c; border: 1px solid #333; color: #ccc;
-        font: 500 12.5px Roboto, Arial, sans-serif;
-      }
-      .chip:hover { border-color: #555; color: #fff; }
-      .chip.active { background: rgba(255, 0, 51, .14); border-color: #ff0033; color: #fff; }
-      .src { font-size: 12px; color: #aaa; }
-      .actions { display: flex; flex-direction: column; gap: 8px; }
-      .actions .primary { padding: 11px 16px; }
+    .skeleton-list { display: flex; flex-direction: column; gap: 4px; padding: 2px 0; }
+    .skel-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      height: 52px; padding: 0 10px; border-radius: 11px;
+    }
+    .skel-meta { display: flex; flex-direction: column; gap: 7px; flex: 1 1 auto; }
+    .skel-bar {
+      height: 11px; border-radius: 6px; background: var(--bg-elevated);
+      animation: pulse 1.3s ease-in-out infinite;
+    }
+    .skel-bar.w1 { width: 34%; height: 13px; }
+    .skel-bar.w2 { width: 66%; }
+    .skel-pill {
+      width: 86px; height: 32px; border-radius: 16px; background: var(--bg-elevated);
+      animation: pulse 1.3s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.55; }
+      50% { opacity: 1; }
+    }
 
-      #tasks {
-        flex: 0 0 auto; max-height: 190px; overflow-y: auto;
-        border-top: 1px solid #272727; padding: 10px 12px; display: flex; flex-direction: column; gap: 9px;
-        background: #0b0b0b;
-      }
-      #tasks[hidden] { display: none; }
-      .task { display: flex; flex-direction: column; gap: 5px; }
-      .task-top { display: flex; align-items: center; gap: 8px; }
-      .task-label { flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .task-x { border: 0; background: transparent; color: #888; cursor: pointer; font-size: 12px; padding: 0 2px; }
-      .task-x:hover { color: #fff; }
-      .bar { height: 4px; border-radius: 4px; background: #262626; overflow: hidden; }
-      .fill { height: 100%; width: 0; border-radius: 4px; background: #ff0033; transition: width .15s linear; }
-      .fill.indet { width: 35%; animation: indet 1.1s ease-in-out infinite; }
-      @keyframes indet { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
-      .task-sub { font-size: 11px; color: #999; }
-      .task.done .fill { background: #2ecc71; }
-      .task.err .fill { background: #ff8a8a; }
-      .task.err .task-sub { color: #ff8a8a; }
+    .state {
+      display: flex; flex-direction: column; align-items: center; gap: 12px;
+      padding: 28px 14px; color: var(--ink-2); text-align: center; font-size: 13px;
+    }
+    .state.err { color: var(--err-ink); }
 
-      @media (max-width: 520px) {
-        #panel { right: 8px; left: 8px; width: auto; bottom: 84px; max-height: 76vh; }
-        #fab { right: 16px; bottom: 16px; }
-      }
-    </style>
+    .list { display: flex; flex-direction: column; gap: 2px; }
+    .row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 10px; border-radius: 11px;
+      transition: background-color .14s ease;
+    }
+    .row:hover { background: var(--bg-hover); }
+    .row .meta { flex: 1 1 auto; min-width: 0; }
+    .q-line { display: flex; align-items: center; gap: 6px; }
+    .q { font-size: 14.5px; font-weight: 700; letter-spacing: -0.015em; color: var(--ink); }
 
-    <button id="fab" type="button" title="Baixar vídeo" aria-label="Baixar vídeo" hidden>
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <path d="M12 4v10m0 0 4-4m-4 4-4-4M5 19h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-    </button>
+    .tier {
+      display: inline-flex; align-items: center;
+      padding: 1px 5px; border-radius: 5px;
+      font-size: 10px; font-weight: 700; letter-spacing: 0.03em; line-height: 1.35;
+    }
+    .tier.ultra { background: var(--accent-soft); color: var(--accent-ink); }
+    .tier.hd { background: var(--bg-elevated); color: var(--ink-2); }
+    .tier.fps { background: var(--bg-elevated); color: var(--ink-2); font-weight: 600; }
 
-    <section id="panel" hidden role="dialog" aria-label="YouTube Downloader">
-      <header>
-        <div class="hdr-text">
-          <div class="hdr-title">Baixar vídeo</div>
-          <div class="hdr-sub" id="vid-title"></div>
-        </div>
-        <button id="close" type="button" title="Fechar" aria-label="Fechar">✕</button>
-      </header>
-      <nav class="tabs">
-        <button class="tab active" data-tab="video" type="button">Vídeo (MP4)</button>
-        <button class="tab" data-tab="audio" type="button">Áudio (MP3)</button>
-      </nav>
-      <div id="body"></div>
-      <div id="tasks" hidden></div>
-    </section>
+    .sub {
+      display: flex; align-items: center; flex-wrap: wrap; row-gap: 2px;
+      margin-top: 2px; font-size: 11.5px; color: var(--ink-2);
+    }
+    .meta-item { display: inline-flex; align-items: center; white-space: nowrap; }
+    .meta-item + .meta-item::before {
+      content: '·'; margin: 0 5px; color: var(--ink-3);
+    }
+    .meta-item.ok { color: var(--ok); font-weight: 500; }
+
+    .row-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+
+    .primary {
+      border: 0; border-radius: 18px; background: var(--accent); color: #ffffff;
+      height: 36px; padding: 0 16px;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      font: 600 12.5px/1 Roboto, Arial, sans-serif;
+      cursor: pointer; white-space: nowrap;
+      transition: background-color .15s ease, opacity .15s ease;
+    }
+    .primary:hover { background: var(--accent-hover); }
+    .primary:disabled { opacity: 0.55; cursor: default; }
+    .primary.sm { height: 32px; padding: 0 13px; border-radius: 16px; min-width: 88px; }
+    .primary.lg { height: 38px; width: 100%; border-radius: 10px; font-size: 13px; }
+
+    .ghost {
+      border: 1px solid var(--line-strong); border-radius: 10px; background: transparent;
+      color: var(--ink); height: 36px; padding: 0 14px;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      font: 500 12.5px/1 Roboto, Arial, sans-serif;
+      cursor: pointer; white-space: nowrap;
+      transition: background-color .15s ease, border-color .15s ease;
+    }
+    .ghost:hover { background: var(--bg-hover); }
+    .ghost:disabled { opacity: 0.5; cursor: default; }
+    .ghost.lg { width: 100%; }
+
+    .icon-ghost {
+      width: 32px; height: 32px; border-radius: 16px;
+      border: 1px solid var(--line); background: transparent; color: var(--ink-2);
+      display: grid; place-items: center; cursor: pointer; padding: 0;
+      transition: background-color .15s ease, color .15s ease, border-color .15s ease;
+    }
+    .icon-ghost:hover {
+      background: var(--bg-elevated); color: var(--ink); border-color: var(--line-strong);
+    }
+    .icon-ghost:disabled { opacity: 0.42; cursor: default; }
+
+    .tab:focus-visible, .primary:focus-visible, .ghost:focus-visible,
+    .icon-ghost:focus-visible, .chip:focus-visible {
+      outline: 2px solid #3ea6ff; outline-offset: 2px;
+    }
+
+    .foot-note {
+      margin-top: 6px; padding: 6px 10px 2px;
+      border-top: 1px solid var(--line);
+      font-size: 11px; line-height: 1.4; color: var(--ink-3);
+    }
+
+    .audio-card { display: flex; flex-direction: column; gap: 14px; padding: 4px 4px 2px; }
+    .audio-src {
+      display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 10px;
+      padding: 9px 12px; border-radius: 10px;
+      background: var(--bg-elevated); font-size: 12px;
+    }
+    .audio-src-label { color: var(--ink-2); font-weight: 500; }
+    .audio-src-val { color: var(--ink); font-weight: 600; }
+
+    .field-label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+    .chips { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 7px; }
+    .chip {
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+      padding: 9px 6px; border-radius: 10px; cursor: pointer;
+      background: var(--bg-elevated); border: 1px solid transparent; color: var(--ink);
+      transition: background-color .15s ease, border-color .15s ease;
+    }
+    .chip:hover { background: var(--bg-hover); }
+    .chip.active {
+      background: var(--accent-soft); border-color: var(--accent);
+    }
+    .chip-kbps { font: 700 13px/1.2 Roboto, Arial, sans-serif; color: var(--ink); }
+    .chip.active .chip-kbps { color: var(--accent-ink); }
+    .chip-est { font: 500 10.5px/1.2 Roboto, Arial, sans-serif; color: var(--ink-2); }
+
+    .actions { display: flex; flex-direction: column; gap: 8px; }
+
+    .start-bar {
+      display: flex; flex-direction: column; gap: 4px;
+      margin: 0 0 8px; padding: 8px 10px; border-radius: 10px; background: var(--bg-elevated);
+    }
+    .start-line { display: flex; align-items: center; gap: 8px; }
+    .start-line .field-label { flex: 1 1 auto; }
+    .start-input {
+      width: 76px; height: 28px; padding: 0 8px; box-sizing: border-box;
+      border: 1px solid var(--line-strong); border-radius: 8px;
+      background: var(--bg-panel); color: var(--ink);
+      font: 500 12.5px/1 Roboto, Arial, sans-serif; text-align: center;
+    }
+    .start-input:focus-visible { outline: 2px solid #3ea6ff; outline-offset: 1px; }
+    .start-input[aria-invalid="true"] { border-color: var(--err); }
+    .start-bar .ghost { height: 28px; padding: 0 10px; border-radius: 8px; font-size: 12px; }
+    .start-hint { font-size: 11px; line-height: 1.35; color: var(--ink-3); }
+    .start-hint.err { color: var(--err-ink); }
+
+    #tasks {
+      flex: 0 0 auto; max-height: 190px; overflow-y: auto;
+      border-top: 1px solid var(--line); padding: 10px 14px 12px;
+      display: flex; flex-direction: column; gap: 10px;
+      background: var(--bg-tray);
+      scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent;
+    }
+    #tasks::-webkit-scrollbar { width: 7px; }
+    #tasks::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 8px; }
+    #tasks[hidden] { display: none; }
+    .task { display: flex; flex-direction: column; gap: 5px; }
+    .task-top { display: flex; align-items: center; gap: 7px; }
+    .task-badge {
+      flex: 0 0 auto; padding: 1px 6px; border-radius: 5px;
+      background: var(--bg-elevated); color: var(--ink);
+      font-size: 10.5px; font-weight: 700;
+    }
+    .task-label {
+      flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 500; color: var(--ink);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .task-pct {
+      flex: 0 0 auto; font-size: 11.5px; font-weight: 700; color: var(--ink-2);
+    }
+    .task-x {
+      flex: 0 0 auto; border: 0; background: transparent; color: var(--ink-2); cursor: pointer;
+      padding: 0; min-width: 24px; min-height: 24px; border-radius: 6px;
+      display: grid; place-items: center; margin-right: -4px;
+      transition: background-color .14s ease, color .14s ease;
+    }
+    .task-x:hover { color: var(--ink); background: var(--line); }
+    .task-x:focus-visible { outline: 2px solid #3ea6ff; outline-offset: 1px; }
+
+    .bar { height: 5px; border-radius: 5px; background: var(--line-strong); overflow: hidden; }
+    .fill {
+      height: 100%; width: 100%; background: var(--accent);
+      transform-origin: left center; transform: scaleX(0);
+      transition: transform .14s linear;
+    }
+    .fill.indet {
+      width: 35%; transform: translateX(-100%); transition: none;
+      animation: indet 1.1s ease-in-out infinite;
+    }
+    @keyframes indet {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(300%); }
+    }
+    .task-sub { font-size: 11px; color: var(--ink-2); }
+    .task.done .fill { background: var(--ok); }
+    .task.done .task-pct { color: var(--ok); }
+    .task.err .fill { background: var(--err); }
+    .task.err .task-sub, .task.err .task-pct { color: var(--err-ink); }
+    .task.cancel .fill { background: var(--ink-3); }
+
+    @media (prefers-reduced-motion: reduce) {
+      .fill.indet, .skel-bar, .skel-pill { animation-duration: 2.6s; }
+      #panel { animation: none; }
+      #fab, #close, .task-x, .fill, .primary, .ghost, .icon-ghost, .row, .tab, .chip { transition: none; }
+      #fab:hover, #fab:active { transform: none; }
+    }
+
+    @media (max-width: 520px) {
+      #panel { right: 8px !important; left: 8px !important; width: auto !important; max-height: 78vh; }
+      #fab { right: 16px; bottom: 16px; }
+    }
   `;
 
+  const fabBtn = document.createElement('button');
+  fabBtn.id = 'fab';
+  fabBtn.type = 'button';
+  fabBtn.title = 'Baixar vídeo';
+  fabBtn.setAttribute('aria-label', 'Baixar vídeo');
+  fabBtn.setAttribute('aria-expanded', 'false');
+  fabBtn.setAttribute('aria-controls', 'panel');
+  fabBtn.hidden = true;
+  fabBtn.appendChild(createIcon(ICON_DOWNLOAD, 22, 2));
+
+  const panelSec = document.createElement('section');
+  panelSec.id = 'panel';
+  panelSec.hidden = true;
+  panelSec.setAttribute('role', 'dialog');
+  panelSec.setAttribute('aria-label', 'Baixar vídeo ou áudio');
+
+  const headerEl = document.createElement('header');
+  const thumbWrap = document.createElement('div');
+  thumbWrap.className = 'thumb-wrap';
+  thumbWrap.hidden = true;
+  const thumbImg = document.createElement('img');
+  thumbImg.className = 'thumb';
+  thumbImg.alt = '';
+  thumbImg.decoding = 'async';
+  thumbImg.addEventListener('error', () => {
+    thumbImg.dataset.failed = '1';
+    thumbWrap.hidden = true;
+  });
+  const durBadge = document.createElement('span');
+  durBadge.className = 'dur';
+  durBadge.hidden = true;
+  thumbWrap.append(thumbImg, durBadge);
+
+  const hdrText = document.createElement('div');
+  hdrText.className = 'hdr-text';
+  const vidTitle = document.createElement('div');
+  vidTitle.className = 'hdr-title';
+  vidTitle.id = 'vid-title';
+  const vidAuthor = document.createElement('div');
+  vidAuthor.className = 'hdr-sub';
+  vidAuthor.id = 'vid-author';
+  hdrText.append(vidTitle, vidAuthor);
+
+  const closeBtn = document.createElement('button');
+  closeBtn.id = 'close';
+  closeBtn.type = 'button';
+  closeBtn.title = 'Fechar';
+  closeBtn.setAttribute('aria-label', 'Fechar');
+  closeBtn.appendChild(createIcon(ICON_CLOSE, 16, 2));
+  headerEl.append(thumbWrap, hdrText, closeBtn);
+
+  const tabsWrap = document.createElement('div');
+  tabsWrap.className = 'tabs-wrap';
+  const tabsNav = document.createElement('nav');
+  tabsNav.className = 'tabs';
+  tabsNav.setAttribute('role', 'tablist');
+  tabsNav.setAttribute('aria-label', 'Tipo de download');
+
+  const tabVideo = document.createElement('button');
+  tabVideo.className = 'tab active';
+  tabVideo.dataset.tab = 'video';
+  tabVideo.type = 'button';
+  tabVideo.setAttribute('role', 'tab');
+  tabVideo.setAttribute('aria-selected', 'true');
+  tabVideo.tabIndex = 0;
+  tabVideo.setAttribute('aria-controls', 'body');
+  const tabVideoText = document.createElement('span');
+  tabVideoText.textContent = 'Vídeo (MP4)';
+  tabVideo.append(createIcon(ICON_VIDEO, 15, 1.85), tabVideoText);
+
+  const tabAudio = document.createElement('button');
+  tabAudio.className = 'tab';
+  tabAudio.dataset.tab = 'audio';
+  tabAudio.type = 'button';
+  tabAudio.setAttribute('role', 'tab');
+  tabAudio.setAttribute('aria-selected', 'false');
+  tabAudio.tabIndex = -1;
+  tabAudio.setAttribute('aria-controls', 'body');
+  const tabAudioText = document.createElement('span');
+  tabAudioText.textContent = 'Áudio (MP3)';
+  tabAudio.append(createIcon(ICON_AUDIO, 15, 1.85), tabAudioText);
+
+  tabsNav.append(tabVideo, tabAudio);
+  tabsWrap.appendChild(tabsNav);
+
+  const bodyDiv = document.createElement('div');
+  bodyDiv.id = 'body';
+  bodyDiv.setAttribute('role', 'status');
+  bodyDiv.setAttribute('aria-live', 'polite');
+
+  const tasksDiv = document.createElement('div');
+  tasksDiv.id = 'tasks';
+  tasksDiv.setAttribute('role', 'status');
+  tasksDiv.setAttribute('aria-live', 'polite');
+  tasksDiv.hidden = true;
+
+  panelSec.append(headerEl, tabsWrap, bodyDiv, tasksDiv);
+  root.append(styleEl, fabBtn, panelSec);
+
   const el = {
-    fab: root.getElementById('fab'),
-    panel: root.getElementById('panel'),
-    title: root.getElementById('vid-title'),
-    body: root.getElementById('body'),
-    tasks: root.getElementById('tasks'),
-    close: root.getElementById('close'),
-    tabs: Array.from(root.querySelectorAll('.tab')),
+    inlineBtn,
+    inlineBadge,
+    fab: fabBtn,
+    panel: panelSec,
+    thumbWrap,
+    thumbImg,
+    durBadge,
+    title: vidTitle,
+    author: vidAuthor,
+    body: bodyDiv,
+    tasks: tasksDiv,
+    close: closeBtn,
+    tabs: [tabVideo, tabAudio],
   };
 
+  function syncTheme() {
+    const isLight = !document.documentElement.hasAttribute('dark');
+    host.toggleAttribute('data-light', isLight);
+    inlineHost.toggleAttribute('data-light', isLight);
+  }
+  syncTheme();
+  new MutationObserver(syncTheme).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['dark'],
+  });
+
+  function syncHeaderMeta() {
+    if (!state.videoId) {
+      el.thumbWrap.hidden = true;
+      el.durBadge.hidden = true;
+      el.title.textContent = 'Downloads em andamento';
+      el.author.textContent = '';
+      return;
+    }
+
+    const expectedThumb = `https://i.ytimg.com/vi/${state.videoId}/mqdefault.jpg`;
+    if (el.thumbImg.dataset.vid !== state.videoId) {
+      delete el.thumbImg.dataset.failed;
+      el.thumbImg.dataset.vid = state.videoId;
+      el.thumbImg.src = expectedThumb;
+    }
+    el.thumbWrap.hidden = Boolean(el.thumbImg.dataset.failed);
+
+    const info = state.formats;
+    el.title.textContent = (info && info.title) || videoTitle() || 'Vídeo do YouTube';
+    el.author.textContent = (info && info.author) || videoAuthor();
+
+    const durText = info && info.duration ? fmtDuration(info.duration) : '';
+    if (durText) {
+      el.durBadge.textContent = durText;
+      el.durBadge.hidden = false;
+    } else {
+      el.durBadge.hidden = true;
+    }
+  }
+
+  function isInlineVisible() {
+    return location.pathname === '/watch'
+      && inlineHost.isConnected
+      && inlineHost.getBoundingClientRect().width > 0;
+  }
+
+  function updateTriggerVisibility() {
+    const inlineActive = isInlineVisible();
+    if (inlineActive) {
+      el.fab.hidden = true;
+      return;
+    }
+    if (location.pathname === '/watch') {
+      el.fab.hidden = tasks.size === 0;
+    } else {
+      el.fab.hidden = !state.videoId && tasks.size === 0;
+    }
+  }
+
+  function findActionsContainer() {
+    return document.querySelector('ytd-watch-metadata #actions #top-level-buttons-computed')
+      || document.querySelector('ytd-watch-metadata #top-level-buttons-computed')
+      || document.querySelector('#above-the-fold #top-level-buttons-computed');
+  }
+
+  function findShareAnchor(container) {
+    const children = Array.from(container.children).filter((child) => child !== inlineHost);
+    for (const child of children) {
+      const labels = Array.from(
+        child.querySelectorAll('[aria-label], [title]'),
+        (node) => `${node.getAttribute('aria-label') || ''} ${node.getAttribute('title') || ''}`,
+      );
+      const text = [
+        child.getAttribute && child.getAttribute('aria-label'),
+        ...labels,
+        child.textContent,
+      ].filter(Boolean).join(' ');
+      if (/\b(compartilhar|share|compartir|partager|teilen)\b/i.test(text)) {
+        return child;
+      }
+    }
+    const likeNode = children.find((child) => /like-dislike/i.test(child.tagName));
+    if (likeNode && likeNode.nextElementSibling && likeNode.nextElementSibling !== inlineHost) {
+      return likeNode.nextElementSibling;
+    }
+    return likeNode || null;
+  }
+
+  function mountInlineButton() {
+    if (location.pathname !== '/watch') {
+      if (inlineHost.isConnected) inlineHost.remove();
+      updateTriggerVisibility();
+      return;
+    }
+
+    const container = findActionsContainer();
+    if (!container) {
+      updateTriggerVisibility();
+      return;
+    }
+
+    const anchor = findShareAnchor(container);
+    if (anchor) {
+      if (anchor.nextElementSibling !== inlineHost) {
+        anchor.after(inlineHost);
+      }
+    } else if (!container.contains(inlineHost)) {
+      container.appendChild(inlineHost);
+    }
+
+    const cs = getComputedStyle(container);
+    const gap = parseFloat(cs.columnGap || cs.gap || '0') || 0;
+    const refMargin = anchor ? (parseFloat(getComputedStyle(anchor).marginLeft) || 0) : 8;
+    inlineHost.style.marginLeft = gap > 0 ? '0px' : `${refMargin || 8}px`;
+
+    updateTriggerVisibility();
+    if (state.open) positionPanel();
+  }
+
+  function positionPanel() {
+    if (!state.open) return;
+
+    if (isInlineVisible()) {
+      const rect = el.inlineBtn.getBoundingClientRect();
+      if (rect.bottom > 48 && rect.top < window.innerHeight - 24) {
+        const panelWidth = Math.min(416, window.innerWidth - 24);
+        const left = Math.min(Math.max(12, rect.left), window.innerWidth - panelWidth - 12);
+        const spaceBelow = window.innerHeight - rect.bottom - 16;
+        const spaceAbove = rect.top - 16;
+
+        el.panel.style.left = `${Math.round(left)}px`;
+        el.panel.style.right = 'auto';
+
+        if (spaceBelow >= 300 || spaceBelow >= spaceAbove) {
+          el.panel.style.top = `${Math.round(rect.bottom + 8)}px`;
+          el.panel.style.bottom = 'auto';
+          el.panel.style.transformOrigin = 'top left';
+          el.panel.style.maxHeight = `${Math.round(Math.min(580, Math.max(240, spaceBelow)))}px`;
+        } else {
+          el.panel.style.top = 'auto';
+          el.panel.style.bottom = `${Math.round(window.innerHeight - rect.top + 8)}px`;
+          el.panel.style.transformOrigin = 'bottom left';
+          el.panel.style.maxHeight = `${Math.round(Math.min(580, Math.max(240, spaceAbove)))}px`;
+        }
+        return;
+      }
+    }
+
+    el.panel.style.top = 'auto';
+    el.panel.style.left = 'auto';
+    el.panel.style.right = '24px';
+    el.panel.style.bottom = el.fab.hidden ? '24px' : '84px';
+    el.panel.style.transformOrigin = 'bottom right';
+    el.panel.style.maxHeight = 'min(76vh, 620px)';
+  }
+
   /* ------------------------------------------------------------------ *
-   *  Tarefas de download
+   *  Tarefas e motor de download paralelo acelerado
    * ------------------------------------------------------------------ */
 
-  function createTask(label, controller) {
+  function syncTasks() {
+    const count = tasks.size;
+    const activeCount = [...tasks.values()].filter((t) => !t.finished).length;
+    const hasError = [...tasks.values()].some((t) => t.node.classList.contains('err'));
+
+    el.tasks.hidden = count === 0;
+    el.fab.toggleAttribute('data-busy', count > 0);
+    el.fab.toggleAttribute('data-err', hasError);
+
+    el.inlineBtn.toggleAttribute('data-err', hasError);
+    if (activeCount > 0 || hasError) {
+      el.inlineBadge.hidden = false;
+      el.inlineBadge.textContent = hasError && activeCount === 0 ? '!' : String(activeCount);
+    } else {
+      el.inlineBadge.hidden = true;
+    }
+
+    updateTriggerVisibility();
+    if (!state.videoId && count === 0 && state.open) {
+      closePanel();
+    }
+  }
+
+  function createTask(badgeText, titleText, controller, filename) {
     const node = document.createElement('div');
     node.className = 'task';
-    node.innerHTML = `
-      <div class="task-top">
-        <span class="task-label"></span>
-        <button class="task-x" type="button" aria-label="Cancelar">✕</button>
-      </div>
-      <div class="bar"><div class="fill"></div></div>
-      <div class="task-sub">Iniciando…</div>
-    `;
-    node.querySelector('.task-label').textContent = label;
+
+    const top = document.createElement('div');
+    top.className = 'task-top';
+
+    const badgeNode = document.createElement('span');
+    badgeNode.className = 'task-badge';
+    badgeNode.textContent = badgeText;
+
+    const labelNode = document.createElement('span');
+    labelNode.className = 'task-label';
+    labelNode.textContent = titleText;
+    labelNode.title = filename || `${badgeText} — ${titleText}`;
+
+    const pctNode = document.createElement('span');
+    pctNode.className = 'task-pct';
+    pctNode.textContent = '0%';
+
+    const xBtn = document.createElement('button');
+    xBtn.className = 'task-x';
+    xBtn.type = 'button';
+    xBtn.title = 'Cancelar';
+    xBtn.setAttribute('aria-label', 'Cancelar');
+    xBtn.appendChild(createIcon(ICON_CLOSE, 13, 2));
+    top.append(badgeNode, labelNode, pctNode, xBtn);
+
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const fillNode = document.createElement('div');
+    fillNode.className = 'fill';
+    bar.appendChild(fillNode);
+
+    const subNode = document.createElement('div');
+    subNode.className = 'task-sub';
+    subNode.textContent = 'Conectando…';
+
+    node.append(top, bar, subNode);
 
     const task = {
       id: ++taskSeq,
-      label,
       controller,
       node,
-      fill: node.querySelector('.fill'),
-      sub: node.querySelector('.task-sub'),
-      x: node.querySelector('.task-x'),
+      fill: fillNode,
+      pct: pctNode,
+      sub: subNode,
+      x: xBtn,
       lastAt: 0,
       lastText: '',
       phase: '',
+      samples: [],
+      smoothBps: 0,
       finished: false,
     };
 
     task.x.addEventListener('click', () => {
       if (task.finished) {
-        node.remove();
-        tasks.delete(task.id);
+        removeTask(task);
         return;
       }
       controller.abort();
@@ -388,99 +1078,298 @@
     });
 
     tasks.set(task.id, task);
-    el.tasks.hidden = false;
     el.tasks.appendChild(node);
+    syncTasks();
     while (tasks.size > 4) {
-      const oldest = [...tasks.values()].find((t) => t !== task && t.finished) || [...tasks.values()][0];
-      if (oldest === task) break;
+      const oldest = [...tasks.values()].find((t) => t !== task && t.finished);
+      if (!oldest) break;
       removeTask(oldest);
     }
     return task;
   }
 
   function removeTask(task) {
+    if (!task.finished) task.controller.abort();
     task.node.remove();
     tasks.delete(task.id);
-    if (!tasks.size) el.tasks.hidden = true;
+    syncTasks();
+  }
+
+  function computeSpeedText(task, now, received) {
+    task.samples.push([now, received]);
+    while (task.samples.length > 1 && now - task.samples[0][0] > 2200) {
+      task.samples.shift();
+    }
+    const first = task.samples[0];
+    const dt = now - first[0];
+    if (dt >= 220 && received > first[1]) {
+      const inst = ((received - first[1]) * 1000) / dt;
+      task.smoothBps = task.smoothBps ? (task.smoothBps * 0.65 + inst * 0.35) : inst;
+    }
+    return task.smoothBps >= 1024 ? ` · ${fmtBytes(task.smoothBps)}/s` : '';
   }
 
   function setProgress(task, phase, received, total) {
-    if (task.finished) return;
+    if (task.finished || task.controller.signal.aborted) return;
     const now = performance.now();
-    const enoughTime = now - task.lastAt > 120;
+    const force = total > 0 && received >= total;
+    if (!force && now - task.lastAt < 110) return;
+
+    const speed = computeSpeedText(task, now, received);
     const pct = total > 0 ? Math.min(100, (received / total) * 100) : null;
     const text = total > 0
-      ? `${phase} · ${fmtBytes(received)} de ${fmtBytes(total)} · ${pct.toFixed(0)}%`
-      : `${phase} · ${fmtBytes(received)}`;
-    if (!enoughTime && text === task.lastText) return;
+      ? `${phase} · ${fmtBytes(received)} de ${fmtBytes(total)}${speed}`
+      : `${phase} · ${fmtBytes(received)}${speed}`;
+
     task.lastAt = now;
     task.lastText = text;
+    task.phase = phase;
     task.sub.textContent = text;
     if (pct !== null) {
       task.fill.classList.remove('indet');
-      task.fill.style.width = `${pct}%`;
+      task.fill.style.transform = `scaleX(${(pct / 100).toFixed(4)})`;
+      task.pct.textContent = `${pct.toFixed(0)}%`;
     } else {
+      task.fill.style.transform = '';
       task.fill.classList.add('indet');
+      task.pct.textContent = '';
     }
   }
 
   function setPct(task, phase, fraction) {
-    if (task.finished) return;
-    const pct = Math.max(0, Math.min(100, fraction * 100));
+    if (task.finished || task.controller.signal.aborted) return;
+    const now = performance.now();
+    const clamped = Math.max(0, Math.min(1, fraction));
+    const phaseChanged = task.phase !== phase;
+    if (!phaseChanged && clamped > 0 && clamped < 1 && now - task.lastAt < 90) return;
+
+    task.lastAt = now;
+    task.phase = phase;
+    const pct = clamped * 100;
     task.fill.classList.remove('indet');
-    task.fill.style.width = `${pct}%`;
-    task.sub.textContent = `${phase} · ${pct.toFixed(0)}%`;
+    task.fill.style.transform = `scaleX(${clamped.toFixed(4)})`;
+    task.pct.textContent = `${pct.toFixed(0)}%`;
+    task.sub.textContent = phase;
   }
 
-  function finishTask(task, phase = 'Concluído', delay = 4000) {
+  function finishTask(task, phase = 'Concluído', delay = 4200) {
     task.finished = true;
     task.fill.classList.remove('indet');
-    task.fill.style.width = '100%';
+    task.fill.style.transform = 'scaleX(1)';
+    task.pct.textContent = '100%';
     task.node.classList.add('done');
     task.sub.textContent = phase;
-    task.x.textContent = '✕';
+    task.x.title = 'Remover';
+    task.x.setAttribute('aria-label', 'Remover');
+    syncTasks();
     setTimeout(() => removeTask(task), delay);
   }
 
   function failTask(task, error) {
     task.finished = true;
+    const cancelled = error && error.name === 'AbortError';
     task.fill.classList.remove('indet');
-    task.fill.style.width = '100%';
-    task.node.classList.add('err');
-    task.sub.textContent = error && error.name === 'AbortError' ? 'Cancelado' : (error.message || String(error));
-    task.x.textContent = '✕';
-    setTimeout(() => removeTask(task), 8000);
+    task.fill.style.transform = 'scaleX(1)';
+    task.pct.textContent = cancelled ? '—' : 'Erro';
+    task.node.classList.add(cancelled ? 'cancel' : 'err');
+    task.sub.textContent = cancelled ? 'Cancelado' : (error.message || String(error));
+    task.x.title = 'Remover';
+    task.x.setAttribute('aria-label', 'Remover');
+    syncTasks();
   }
 
-  async function downloadToBlob(url, task, expectedSize, mime, phase = 'Baixando') {
-    const response = await fetch(url, { signal: task.controller.signal, credentials: 'omit' });
-    if (!response.ok) throw new Error(`Falha no download (HTTP ${response.status}).`);
-    const total = Number(response.headers.get('content-length')) || expectedSize || 0;
+  function withRangeParam(rawUrl, start, end) {
+    const parsed = new URL(rawUrl, location.origin);
+    parsed.searchParams.set('range', `${start}-${end}`);
+    return parsed.href;
+  }
 
+  async function readResponseToBlob(response, onDelta) {
     if (!response.body) {
-      const blob = await response.blob();
-      setProgress(task, phase, blob.size, blob.size || total);
-      return blob;
+      const buf = await response.arrayBuffer();
+      if (buf.byteLength) onDelta(buf.byteLength);
+      return new Blob([buf]);
     }
-
     const reader = response.body.getReader();
-    const chunks = [];
-    let received = 0;
+    const parts = [];
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      chunks.push(value);
-      received += value.length;
-      setProgress(task, phase, received, total);
+      parts.push(value);
+      onDelta(value.byteLength);
     }
-    return new Blob(chunks, { type: mime || 'application/octet-stream' });
+    return new Blob(parts);
+  }
+
+  async function fetchChunkWithRetry(chunkUrl, expectedChunkLen, signal, onDelta, isSecondaryChunk) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let chunkRead = 0;
+      try {
+        const response = await fetch(chunkUrl, { signal, credentials: 'omit' });
+        if (!response.ok) {
+          const err = new Error(`Falha no download (HTTP ${response.status}).`);
+          err.status = response.status;
+          throw err;
+        }
+        const headerLen = Number(response.headers.get('content-length')) || 0;
+        if (isSecondaryChunk && expectedChunkLen > 0 && headerLen > expectedChunkLen * 1.5) {
+          if (response.body) response.body.cancel().catch(() => {});
+          const err = new Error('RANGE_IGNORED');
+          err.rangeIgnored = true;
+          throw err;
+        }
+        return await readResponseToBlob(response, (bytes) => {
+          chunkRead += bytes;
+          onDelta(bytes);
+        });
+      } catch (error) {
+        if (chunkRead > 0) onDelta(-chunkRead);
+        // 403 não melhora com nova tentativa: deixa o chamador trocar de cliente.
+        if (signal.aborted || (error && (error.name === 'AbortError' || error.rangeIgnored || error.status === 403))) {
+          throw error;
+        }
+        lastError = error;
+        if (attempt < 2) await sleep(220 * (attempt + 1));
+      }
+    }
+    throw lastError || new Error('Falha de rede durante o download.');
+  }
+
+  async function fetchStreamFallback(url, signal, mime, onDelta, onTotal) {
+    const response = await fetch(url, { signal, credentials: 'omit' });
+    if (!response.ok) throw new Error(`Falha no download (HTTP ${response.status}).`);
+    const total = Number(response.headers.get('content-length')) || 0;
+    if (total && onTotal) onTotal(total);
+    const blob = await readResponseToBlob(response, onDelta);
+    return new Blob([blob], { type: mime || 'application/octet-stream' });
+  }
+
+  async function probeContentLength(url, signal) {
+    try {
+      const response = await fetch(url, { method: 'HEAD', signal, credentials: 'omit' });
+      if (response.ok) return Number(response.headers.get('content-length')) || 0;
+    } catch (error) {
+      if (signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+    }
+    return 0;
+  }
+
+  async function fetchFastBlob(url, { signal, expectedSize = 0, mime = 'application/octet-stream', onDelta, onTotal }) {
+    // Sem tamanho conhecido, os pedaços só poderiam ser baixados um por vez.
+    if (!expectedSize) {
+      expectedSize = await probeContentLength(url, signal);
+      if (expectedSize && onTotal) onTotal(expectedSize);
+    }
+
+    if (expectedSize > 0) {
+      const ranges = [];
+      for (let start = 0; start < expectedSize; start += RANGE_CHUNK_BYTES) {
+        const end = Math.min(expectedSize - 1, start + RANGE_CHUNK_BYTES - 1);
+        ranges.push([start, end]);
+      }
+
+      if (ranges.length === 1) {
+        const [s, e] = ranges[0];
+        const part = await fetchChunkWithRetry(withRangeParam(url, s, e), e - s + 1, signal, onDelta, false);
+        return new Blob([part], { type: mime });
+      }
+
+      const chunks = new Array(ranges.length);
+      let cursor = 0;
+      const runController = new AbortController();
+      const onParentAbort = () => runController.abort();
+      signal.addEventListener('abort', onParentAbort, { once: true });
+
+      try {
+        const workerCount = Math.min(RANGE_CONCURRENCY, ranges.length);
+        const workers = Array.from({ length: workerCount }, async () => {
+          while (cursor < ranges.length) {
+            const index = cursor++;
+            const [s, e] = ranges[index];
+            chunks[index] = await fetchChunkWithRetry(
+              withRangeParam(url, s, e),
+              e - s + 1,
+              runController.signal,
+              onDelta,
+              index > 0,
+            );
+          }
+        });
+        await Promise.all(workers);
+        return new Blob(chunks, { type: mime });
+      } catch (error) {
+        runController.abort();
+        if (error && error.rangeIgnored && !signal.aborted) {
+          return fetchStreamFallback(url, signal, mime, onDelta, onTotal);
+        }
+        if (signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+        throw error;
+      } finally {
+        signal.removeEventListener('abort', onParentAbort);
+      }
+    }
+
+    const parts = [];
+    let offset = 0;
+    for (;;) {
+      if (signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+      const end = offset + RANGE_CHUNK_BYTES - 1;
+      const part = await fetchChunkWithRetry(withRangeParam(url, offset, end), RANGE_CHUNK_BYTES, signal, onDelta, false);
+      parts.push(part);
+      if (part.size < RANGE_CHUNK_BYTES || part.size > RANGE_CHUNK_BYTES) break;
+      offset += part.size;
+    }
+    return new Blob(parts, { type: mime });
+  }
+
+  // Tenta o link principal e, se falhar, o mesmo itag vindo dos outros clientes.
+  async function fetchFormatBlob(format, { signal, onDelta, onTotal }) {
+    const urls = [format.url, ...(format.fallbacks || [])];
+    let lastError = null;
+    for (const url of urls) {
+      let attemptReceived = 0;
+      try {
+        return await fetchFastBlob(url, {
+          signal,
+          expectedSize: format.size,
+          mime: format.mime,
+          onTotal,
+          onDelta: (delta) => {
+            attemptReceived += delta;
+            onDelta(delta);
+          },
+        });
+      } catch (error) {
+        if (signal.aborted || (error && error.name === 'AbortError')) throw error;
+        if (attemptReceived > 0) onDelta(-attemptReceived);
+        lastError = error;
+        console.warn('[YouTube Downloader] Link falhou, tentando outro cliente:', format.itag, error);
+      }
+    }
+    throw lastError || new Error('Falha de rede durante o download.');
+  }
+
+  async function downloadToBlob(format, task, phase = 'Baixando') {
+    let received = 0;
+    let total = format.size || 0;
+    return fetchFormatBlob(format, {
+      signal: task.controller.signal,
+      onTotal: (discovered) => { total = discovered; },
+      onDelta: (delta) => {
+        received = Math.max(0, received + delta);
+        setProgress(task, phase, received, total);
+      },
+    });
   }
 
   /* ------------------------------------------------------------------ *
    *  Extração de formatos
    * ------------------------------------------------------------------ */
 
-  function getVisitorData() {
+  let anonVisitorCache = { value: null, expiresAt: 0, pending: null };
+
+  function getPageVisitorData() {
     try {
       if (window.ytcfg && typeof window.ytcfg.get === 'function') {
         return window.ytcfg.get('VISITOR_DATA') || null;
@@ -491,32 +1380,81 @@
     return null;
   }
 
-  async function requestClient(client, videoId) {
+  async function getAnonVisitorData() {
+    const now = Date.now();
+    if (anonVisitorCache.value && now < anonVisitorCache.expiresAt) {
+      return anonVisitorCache.value;
+    }
+    if (anonVisitorCache.pending) return anonVisitorCache.pending;
+
+    anonVisitorCache.pending = (async () => {
+      try {
+        const res = await fetch(SW_DATA_URL, { credentials: 'omit' });
+        if (res.ok) {
+          const rawText = await res.text();
+          const parsed = JSON.parse(rawText.replace(/^\)\]\}'\s*/, ''));
+          const token = parsed
+            && parsed[0]
+            && parsed[0][2]
+            && parsed[0][2][0]
+            && parsed[0][2][0][0]
+            && parsed[0][2][0][0][13];
+          if (typeof token === 'string' && token) {
+            anonVisitorCache.value = token;
+            anonVisitorCache.expiresAt = Date.now() + 25 * 60 * 1000;
+            return token;
+          }
+        }
+      } catch (error) {
+        // segue para fallback do ytcfg
+      } finally {
+        anonVisitorCache.pending = null;
+      }
+      return getPageVisitorData();
+    })();
+
+    return anonVisitorCache.pending;
+  }
+
+  async function requestClient(client, videoId, visitor) {
+    const clientCtx = { ...client.payload.context.client };
+    if (visitor) clientCtx.visitorData = visitor;
+
     const payload = {
       ...client.payload,
-      context: { ...client.payload.context, client: { ...client.payload.context.client } },
+      context: { ...client.payload.context, client: clientCtx },
       videoId,
       contentCheckOk: true,
       racyCheckOk: true,
     };
 
-    const visitor = getVisitorData();
-    if (visitor) {
-      payload.context.client.visitorData = visitor;
-      if (!payload.context.client.userAgent) payload.context.client.userAgent = navigator.userAgent;
-    }
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-YouTube-Client-Name': String(client.clientId),
+      'X-YouTube-Client-Version': clientCtx.clientVersion,
+    };
+    if (visitor) headers['X-Goog-Visitor-Id'] = visitor;
 
     const response = await fetch(API_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
+      headers,
+      credentials: 'omit',
       body: JSON.stringify(payload),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
   }
 
-  function normalizeFormat(format) {
+  function urlContentLength(rawUrl) {
+    if (!rawUrl) return 0;
+    try {
+      return Number(new URL(rawUrl).searchParams.get('clen')) || 0;
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  function normalizeFormat(format, priority = 0) {
     const mime = format.mimeType || '';
     const [type, rawCodecs] = mime.split(';');
     const codecs = (rawCodecs || '')
@@ -526,17 +1464,23 @@
       .map((c) => c.trim())
       .filter(Boolean);
 
-    const container = type === 'video/mp4' || type === 'audio/mp4'
-      ? 'mp4'
-      : type === 'video/webm' || type === 'audio/webm'
-        ? 'webm'
-        : type === 'video/3gpp'
-          ? '3gp'
-          : (type.split('/')[1] || '');
+    const container = type === 'audio/mp4'
+      ? 'm4a'
+      : type === 'video/mp4'
+        ? 'mp4'
+        : type === 'video/webm' || type === 'audio/webm'
+          ? 'webm'
+          : type === 'video/3gpp'
+            ? '3gp'
+            : (type.split('/')[1] || '');
 
     const isAudio = type.startsWith('audio/');
     const isVideo = type.startsWith('video/');
     const hasAudio = isVideo && (Boolean(format.audioQuality) || Boolean(format.audioChannels) || format.itag === 18 || format.itag === 22);
+    const track = format.audioTrack || null;
+    const isDefaultAudio = !track
+      || Boolean(track.audioIsDefault)
+      || /original/i.test(track.displayName || '');
 
     return {
       itag: format.itag,
@@ -548,36 +1492,65 @@
       isVideo,
       isAudio,
       hasAudio,
+      isDefaultAudio,
+      isDrc: Boolean(format.isDrc),
       height: format.height || 0,
       fps: format.fps || 0,
       bitrate: format.bitrate || 0,
       sampleRate: Number(format.audioSampleRate) || 0,
       channels: format.audioChannels || 0,
-      size: Number(format.contentLength) || 0,
+      size: Number(format.contentLength) || urlContentLength(format.url),
+      priority,
+      trackId: (track && track.id) || '',
+      fallbacks: [],
       qualityLabel: format.qualityLabel || (format.height ? `${format.height}p` : (format.quality || '')),
     };
   }
 
+  // Menor prioridade = cliente mais confiável (VISIONOS antes de ANDROID_VR,
+  // que leva 403 após ~1 min de mídia; player da página por último, pois o
+  // parâmetro "n" dele não é transformado e o YouTube limita a velocidade).
+  function formatCandidateRank(fmt) {
+    return (fmt.isDefaultAudio ? 10000 : 0)
+      + (!fmt.isDrc ? 1000 : 0)
+      - fmt.priority * 100
+      + (fmt.size > 0 ? 50 : 0)
+      + Math.min(49, (fmt.bitrate || 0) / 1e5);
+  }
+
   function getPagePlayerResponse(videoId) {
+    try {
+      const player = document.getElementById('movie_player');
+      if (player && typeof player.getPlayerResponse === 'function') {
+        const live = player.getPlayerResponse();
+        if (live && live.streamingData && live.videoDetails && live.videoDetails.videoId === videoId) {
+          return live;
+        }
+      }
+    } catch (error) {
+      // player não exposto
+    }
     try {
       const data = window.ytInitialPlayerResponse;
       if (data && data.streamingData && data.videoDetails && data.videoDetails.videoId === videoId) {
         return data;
       }
     } catch (error) {
-      // sem dados da página
+      // sem dados iniciais
     }
     return null;
   }
 
   async function loadFormats(videoId) {
-    const results = await Promise.allSettled(CLIENTS.map((client) => requestClient(client, videoId)));
-    const responses = results
-      .filter((r) => r.status === 'fulfilled' && r.value)
-      .map((r) => r.value);
+    const visitor = await getAnonVisitorData();
+    const results = await Promise.allSettled(CLIENTS.map((client) => requestClient(client, videoId, visitor)));
+    const responses = [];
+    results.forEach((r, index) => {
+      if (r.status === 'fulfilled' && r.value) responses.push({ ...r.value, __priority: index });
+    });
 
     const pageResponse = getPagePlayerResponse(videoId);
-    if (pageResponse) responses.unshift(pageResponse);
+    if (pageResponse) responses.push({ ...pageResponse, __priority: PAGE_PRIORITY });
 
     if (!responses.length) throw new Error('Não foi possível consultar o YouTube. Verifique sua conexão.');
 
@@ -589,18 +1562,25 @@
       throw new Error(reason || 'Este vídeo não disponibiliza formatos para download.');
     }
 
-    const formats = new Map();
+    const candidates = new Map();
     const ciphered = [];
     let jsUrl = null;
 
+    const addCandidate = (normalized) => {
+      const list = candidates.get(normalized.itag) || [];
+      list.push(normalized);
+      candidates.set(normalized.itag, list);
+    };
+
     for (const response of withStreams) {
       if (!jsUrl && response.assets && response.assets.js) jsUrl = response.assets.js;
+      const priority = response.__priority;
       const data = response.streamingData;
       const all = [...(data.formats || []), ...(data.adaptiveFormats || [])];
       for (const format of all) {
-        if (!format.itag || formats.has(format.itag)) continue;
-        const normalized = normalizeFormat(format);
-        if (normalized.url) formats.set(format.itag, normalized);
+        if (!format.itag) continue;
+        const normalized = normalizeFormat(format, priority);
+        if (normalized.url) addCandidate(normalized);
         else if (normalized.cipher) ciphered.push({ format, normalized });
       }
     }
@@ -611,11 +1591,13 @@
         if (url) {
           const decode = await buildSigDecoder(url);
           for (const { format, normalized } of ciphered) {
-            if (formats.has(format.itag)) continue;
+            if (candidates.has(format.itag)) continue;
             const direct = decodeCipher(format.signatureCipher, decode);
             if (direct) {
               normalized.url = direct;
-              formats.set(format.itag, normalized);
+              normalized.priority = CIPHER_PRIORITY;
+              if (!normalized.size) normalized.size = urlContentLength(direct);
+              addCandidate(normalized);
             }
           }
         }
@@ -624,11 +1606,33 @@
       }
     }
 
-    const list = [...formats.values()];
+    const details = withStreams.map((r) => r.videoDetails).find((d) => d && d.title) || {};
+    const duration = Number(details.lengthSeconds) || 0;
+
+    const list = [];
+    for (const group of candidates.values()) {
+      group.sort((a, b) => formatCandidateRank(b) - formatCandidateRank(a));
+      const best = group[0];
+      // Mesma faixa vinda de outros clientes: usada se o link principal falhar.
+      best.fallbacks = group
+        .slice(1)
+        .filter((alt) => alt.isDrc === best.isDrc && alt.trackId === best.trackId && alt.url !== best.url)
+        .map((alt) => alt.url);
+      if (!best.size) best.size = (group.find((alt) => alt.size > 0 && alt.trackId === best.trackId) || {}).size || 0;
+      // Formato só disponível num cliente que leva 403 após ~1 min de mídia
+      // (ex.: itag 18 do ANDROID_VR): em vídeos longos o download falharia.
+      const source = CLIENTS[best.priority];
+      if (source && source.limitedSeconds && !best.fallbacks.length && duration > source.limitedSeconds) continue;
+      list.push(best);
+    }
     if (!list.some((f) => f.url)) throw new Error('Nenhum formato baixável foi encontrado para este vídeo.');
 
-    const details = withStreams.map((r) => r.videoDetails).find((d) => d && d.title);
-    return { formats: list, title: details ? details.title : videoTitle() };
+    return {
+      formats: list,
+      title: details.title || videoTitle(),
+      author: details.author || videoAuthor(),
+      duration,
+    };
   }
 
   function decodeCipher(cipher, decoder) {
@@ -733,13 +1737,20 @@
    * ------------------------------------------------------------------ */
 
   function audioCandidates(formats) {
-    return formats
+    const standalone = formats
       .filter((f) => f.isAudio && f.url)
       .sort((a, b) => {
+        if (a.isDefaultAudio !== b.isDefaultAudio) return a.isDefaultAudio ? -1 : 1;
+        if (a.isDrc !== b.isDrc) return a.isDrc ? 1 : -1;
+        if (a.priority !== b.priority) return a.priority - b.priority;
         const aac = /mp4a/i.test(a.codec) ? 1 : 0;
         const other = /mp4a/i.test(b.codec) ? 1 : 0;
         return other - aac || b.bitrate - a.bitrate;
       });
+    if (standalone.length) return standalone;
+    return formats
+      .filter((f) => f.hasAudio && f.url)
+      .sort((a, b) => a.priority - b.priority || b.bitrate - a.bitrate);
   }
 
   async function decodeAudio(blob) {
@@ -753,6 +1764,21 @@
     }
   }
 
+  function sliceAudioBuffer(buffer, start) {
+    const from = Math.floor(start * buffer.sampleRate);
+    if (from <= 0) return buffer;
+    if (from >= buffer.length) throw new Error('O ponto de início fica depois do fim do áudio.');
+    const sliced = new AudioBuffer({
+      numberOfChannels: buffer.numberOfChannels,
+      length: buffer.length - from,
+      sampleRate: buffer.sampleRate,
+    });
+    for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+      sliced.copyToChannel(buffer.getChannelData(channel).subarray(from), channel);
+    }
+    return sliced;
+  }
+
   async function resampleBuffer(buffer, rate) {
     if (buffer.sampleRate === rate) return buffer;
     const frames = Math.ceil((buffer.duration || 0) * rate);
@@ -764,13 +1790,17 @@
     return context.startRendering();
   }
 
-  async function encodeMp3(buffer, kbps, onProgress) {
+  async function encodeMp3(buffer, kbps, signal, onProgress) {
     if (typeof lamejs === 'undefined') {
       throw new Error('O encoder MP3 não foi carregado. Verifique se o Tampermonkey conseguiu acessar o CDN.');
     }
+    if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
 
     let audio = buffer;
-    if (!MP3_RATES.includes(audio.sampleRate)) audio = await resampleBuffer(audio, 48000);
+    if (!MP3_RATES.includes(audio.sampleRate)) {
+      audio = await resampleBuffer(audio, 48000);
+      if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+    }
 
     const channels = Math.min(2, audio.numberOfChannels);
     const left = audio.getChannelData(0);
@@ -781,8 +1811,10 @@
     const chunks = [];
     const leftInt = new Int16Array(block);
     const rightInt = new Int16Array(block);
+    let sliceStart = performance.now();
 
     for (let offset = 0; offset < total; offset += block) {
+      if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
       const count = Math.min(block, total - offset);
       for (let i = 0; i < count; i++) {
         const l = Math.max(-1, Math.min(1, left[offset + i]));
@@ -798,12 +1830,15 @@
         : encoder.encodeBuffer(leftSlice);
       if (encoded.length) chunks.push(encoded);
 
-      if ((offset / block) % 400 === 0) {
-        await sleep(0);
+      if (performance.now() - sliceStart >= 14) {
         onProgress(offset / total);
+        await yieldThread();
+        if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+        sliceStart = performance.now();
       }
     }
 
+    if (signal && signal.aborted) throw new DOMException('Cancelado', 'AbortError');
     const tail = encoder.flush();
     if (tail.length) chunks.push(tail);
     onProgress(1);
@@ -820,75 +1855,116 @@
     return lib;
   }
 
-  async function muxToMp4(videoBlob, audioBlob, controller, onProgress) {
+  // Copia os pacotes (sem recodificar) de faixas de vídeo e/ou áudio para um
+  // novo arquivo. Com start > 0, corta o começo: o vídeo parte do quadro-chave
+  // anterior a start e o áudio é alinhado a esse mesmo ponto.
+  async function remuxMedia({ videoBlob = null, audioBlob = null, container = 'mp4', start = 0, controller, onProgress }) {
     const lib = getMediabunny();
-    const videoInput = new lib.Input({ source: new lib.BlobSource(videoBlob), formats: lib.ALL_FORMATS });
-    const audioInput = new lib.Input({ source: new lib.BlobSource(audioBlob), formats: lib.ALL_FORMATS });
+    const inputs = [];
+    const openInput = (blob) => {
+      const input = new lib.Input({ source: new lib.BlobSource(blob), formats: lib.ALL_FORMATS });
+      inputs.push(input);
+      return input;
+    };
 
     try {
-      const videoTrack = await videoInput.getPrimaryVideoTrack();
-      const audioTrack = await audioInput.getPrimaryAudioTrack();
-      if (!videoTrack) throw new Error('Faixa de vídeo não encontrada no arquivo baixado.');
-      if (!audioTrack) throw new Error('Faixa de áudio não encontrada no arquivo baixado.');
+      const tracks = [];
+      if (videoBlob) {
+        const input = openInput(videoBlob);
+        const track = await input.getPrimaryVideoTrack();
+        if (!track) throw new Error('Faixa de vídeo não encontrada no arquivo baixado.');
+        tracks.push({ kind: 'video', input, track });
+      }
+      if (audioBlob) {
+        const input = openInput(audioBlob);
+        const track = await input.getPrimaryAudioTrack();
+        if (!track) throw new Error('Faixa de áudio não encontrada no arquivo baixado.');
+        tracks.push({ kind: 'audio', input, track });
+      }
+      if (!tracks.length) throw new Error('Os arquivos baixados não possuem mídia.');
 
-      const videoCodec = await videoTrack.getCodec();
-      const audioCodec = await audioTrack.getCodec();
-      if (!videoCodec || !audioCodec) throw new Error('Não foi possível identificar os codecs do vídeo.');
+      for (const entry of tracks) {
+        entry.codec = await entry.track.getCodec();
+        if (!entry.codec) throw new Error('Não foi possível identificar os codecs do vídeo.');
+        entry.config = await entry.track.getDecoderConfig();
+        entry.sink = new lib.EncodedPacketSink(entry.track);
+      }
 
-      const videoConfig = await videoTrack.getDecoderConfig();
-      const audioConfig = await audioTrack.getDecoderConfig();
+      let cut = 0;
+      if (start > 0) {
+        const total = await tracks[0].input.computeDuration().catch(() => 0);
+        if (total && start >= total) throw new Error('O ponto de início fica depois do fim do vídeo.');
+        cut = start;
+        const video = tracks.find((t) => t.kind === 'video');
+        if (video) {
+          const key = await video.sink.getKeyPacket(start, { verifyKeyPackets: true });
+          if (key) {
+            video.startPacket = key;
+            cut = key.timestamp;
+          }
+        }
+        for (const entry of tracks) {
+          if (entry.kind !== 'audio') continue;
+          const packet = await entry.sink.getPacket(cut);
+          if (packet) entry.startPacket = packet;
+        }
+        if (!tracks.some((t) => t.startPacket)) throw new Error('O ponto de início fica depois do fim do vídeo.');
+      }
 
       const target = new lib.BufferTarget();
-      const output = new lib.Output({ format: new lib.Mp4OutputFormat(), target });
-      const videoSource = new lib.EncodedVideoPacketSource(videoCodec);
-      const audioSource = new lib.EncodedAudioPacketSource(audioCodec);
-      output.addVideoTrack(videoSource, videoConfig ? { decoderConfig: videoConfig } : undefined);
-      output.addAudioTrack(audioSource, audioConfig ? { decoderConfig: audioConfig } : undefined);
+      const outputFormat = container === 'webm' ? new lib.WebMOutputFormat() : new lib.Mp4OutputFormat();
+      const output = new lib.Output({ format: outputFormat, target });
+      for (const entry of tracks) {
+        const options = entry.config ? { decoderConfig: entry.config } : undefined;
+        if (entry.kind === 'video') {
+          entry.source = new lib.EncodedVideoPacketSource(entry.codec);
+          output.addVideoTrack(entry.source, options);
+        } else {
+          entry.source = new lib.EncodedAudioPacketSource(entry.codec);
+          output.addAudioTrack(entry.source, options);
+        }
+      }
       await output.start();
 
       try {
-        const videoIterator = new lib.EncodedPacketSink(videoTrack).packets();
-        const audioIterator = new lib.EncodedPacketSink(audioTrack).packets();
-
-        let videoNext = await videoIterator.next();
-        let audioNext = await audioIterator.next();
-        if (videoNext.done && audioNext.done) throw new Error('Os arquivos baixados não possuem mídia.');
-
-        const videoOffset = videoNext.done ? 0 : videoNext.value.timestamp;
-        const audioOffset = audioNext.done ? 0 : audioNext.value.timestamp;
+        for (const entry of tracks) {
+          entry.iterator = entry.sink.packets(entry.startPacket);
+          entry.next = await entry.iterator.next();
+          entry.offset = entry.next.done ? 0 : entry.next.value.timestamp;
+          entry.first = true;
+        }
+        if (tracks.every((t) => t.next.done)) throw new Error('Os arquivos baixados não possuem mídia.');
 
         let duration = 0;
-        for (const [input, track] of [[videoInput, videoTrack], [audioInput, audioTrack]]) {
+        for (const entry of tracks) {
           try {
-            const value = await input.getDurationFromMetadata([track]);
+            const value = await entry.input.getDurationFromMetadata([entry.track]);
             if (value && value > duration) duration = value;
           } catch (error) {
-            // duração desconhecida: segue com progresso indeterminado
+            // duração desconhecida
           }
         }
+        const span = duration > cut ? duration - cut : 0;
+        let packetStep = 0;
 
-        let firstVideo = true;
-        let firstAudio = true;
-
-        while (!videoNext.done || !audioNext.done) {
+        for (;;) {
           if (controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
 
-          const takeVideo = !videoNext.done
-            && (audioNext.done || (videoNext.value.timestamp - videoOffset) <= (audioNext.value.timestamp - audioOffset));
-
-          if (takeVideo) {
-            const packet = videoNext.value.clone({ timestamp: videoNext.value.timestamp - videoOffset });
-            await videoSource.add(packet, firstVideo ? { decoderConfig: videoConfig || undefined } : undefined);
-            firstVideo = false;
-            if (duration) onProgress(Math.min(0.99, packet.timestamp / duration));
-            videoNext = await videoIterator.next();
-          } else {
-            const packet = audioNext.value.clone({ timestamp: audioNext.value.timestamp - audioOffset });
-            await audioSource.add(packet, firstAudio ? { decoderConfig: audioConfig || undefined } : undefined);
-            firstAudio = false;
-            if (duration) onProgress(Math.min(0.99, packet.timestamp / duration));
-            audioNext = await audioIterator.next();
+          let entry = null;
+          for (const candidate of tracks) {
+            if (candidate.next.done) continue;
+            if (!entry || (candidate.next.value.timestamp - candidate.offset) < (entry.next.value.timestamp - entry.offset)) {
+              entry = candidate;
+            }
           }
+          if (!entry) break;
+
+          const raw = entry.next.value;
+          const packet = entry.offset ? raw.clone({ timestamp: raw.timestamp - entry.offset }) : raw;
+          await entry.source.add(packet, entry.first ? { decoderConfig: entry.config || undefined } : undefined);
+          entry.first = false;
+          if (span && (++packetStep & 127) === 0) onProgress(Math.min(0.99, packet.timestamp / span));
+          entry.next = await entry.iterator.next();
         }
 
         await output.finalize();
@@ -897,11 +1973,10 @@
         throw error;
       }
 
-      if (!target.buffer) throw new Error('Falha ao gerar o arquivo MP4.');
-      return new Blob([target.buffer], { type: 'video/mp4' });
+      if (!target.buffer) throw new Error('Falha ao gerar o arquivo.');
+      return new Blob([target.buffer], { type: container === 'webm' ? (videoBlob ? 'video/webm' : 'audio/webm') : (videoBlob ? 'video/mp4' : 'audio/mp4') });
     } finally {
-      videoInput.dispose();
-      audioInput.dispose();
+      for (const input of inputs) input.dispose();
     }
   }
 
@@ -909,63 +1984,142 @@
    *  Ações
    * ------------------------------------------------------------------ */
 
+  function qualitySuffix(format) {
+    return `${format.qualityLabel}${format.fps > 30 ? ` ${format.fps}fps` : ''}`;
+  }
+
   async function startVideoDownload(format) {
+    const videoId = state.videoId;
+    const title = state.formats.title;
+    const key = `video:${videoId}:${format.itag}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+
     const controller = new AbortController();
+    const start = state.startAt;
+    const quality = qualitySuffix(format);
     const suffix = format.hasAudio ? '' : ' (sem áudio)';
-    const filename = `${sanitizeName(state.formats.title)} [${state.videoId}] - ${format.qualityLabel}${format.fps > 30 ? ` ${format.fps}fps` : ''}${suffix}.${format.container}`;
-    const task = createTask(filename, controller);
-    console.info('[YouTube Downloader] Baixando:', format.itag, format.url.slice(0, 120));
+    const ext = start > 0 && format.container !== 'webm' ? 'mp4' : format.container;
+    const filename = `${sanitizeName(title)} [${videoId}] - ${quality}${suffix}${startSuffix(start)}.${ext}`;
+    const badge = `${quality} ${ext.toUpperCase()}`;
+    const task = createTask(badge, `${title}${suffix}`, controller, filename);
 
     try {
-      const blob = await downloadToBlob(format.url, task, format.size, format.mime);
-      finishTask(task, 'Salvo');
+      let blob = await downloadToBlob(format, task);
+      if (start > 0) {
+        setPct(task, 'Cortando o início…', 0);
+        blob = await remuxMedia({
+          videoBlob: blob,
+          audioBlob: format.hasAudio ? blob : null,
+          container: ext,
+          start,
+          controller,
+          onProgress: (fraction) => setPct(task, 'Cortando o início…', fraction),
+        });
+      }
+      finishTask(task, 'Salvo no dispositivo');
       saveBlob(blob, filename);
     } catch (error) {
       console.warn('[YouTube Downloader]', error);
       failTask(task, error);
+    } finally {
+      busy.delete(key);
     }
   }
 
   async function startMergedDownload(format) {
-    const audioFormat = audioCandidates(state.formats.formats)[0];
+    const audioFormat = audioCandidates(state.formats.formats).find((f) => f.isAudio)
+      || audioCandidates(state.formats.formats)[0];
     if (!audioFormat) {
       await startVideoDownload(format);
       return;
     }
 
+    const videoId = state.videoId;
+    const title = state.formats.title;
+    const key = `merge:${videoId}:${format.itag}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+
     const controller = new AbortController();
-    const quality = `${format.qualityLabel}${format.fps > 30 ? ` ${format.fps}fps` : ''}`;
-    const filename = `${sanitizeName(state.formats.title)} [${state.videoId}] - ${quality}.mp4`;
-    const task = createTask(filename, controller);
+    const start = state.startAt;
+    const quality = qualitySuffix(format);
+    const filename = `${sanitizeName(title)} [${videoId}] - ${quality}${startSuffix(start)}.mp4`;
+    const task = createTask(`${quality} MP4`, title, controller, filename);
 
     try {
-      const videoBlob = await downloadToBlob(format.url, task, format.size, format.mime, 'Baixando vídeo');
-      const audioBlob = await downloadToBlob(audioFormat.url, task, audioFormat.size, audioFormat.mime, 'Baixando áudio');
+      const sizes = [format.size || 0, audioFormat.size || 0];
+      const totalExpected = () => (sizes[0] > 0 && sizes[1] > 0 ? sizes[0] + sizes[1] : 0);
+      let combinedReceived = 0;
 
-      setPct(task, 'Montando MP4', 0);
-      const merged = await muxToMp4(videoBlob, audioBlob, controller, (fraction) => {
-        setPct(task, 'Montando MP4', fraction);
+      const onDelta = (delta) => {
+        combinedReceived = Math.max(0, combinedReceived + delta);
+        setProgress(task, 'Baixando', combinedReceived, totalExpected());
+      };
+
+      const [videoBlob, audioBlob] = await Promise.all([
+        fetchFormatBlob(format, {
+          signal: controller.signal,
+          onDelta,
+          onTotal: (discovered) => { sizes[0] = discovered; },
+        }),
+        fetchFormatBlob(audioFormat, {
+          signal: controller.signal,
+          onDelta,
+          onTotal: (discovered) => { sizes[1] = discovered; },
+        }),
+      ]);
+
+      setPct(task, 'Unindo vídeo e áudio em MP4…', 0);
+      const merged = await remuxMedia({
+        videoBlob,
+        audioBlob,
+        container: 'mp4',
+        start,
+        controller,
+        onProgress: (fraction) => setPct(task, 'Unindo vídeo e áudio em MP4…', fraction),
       });
 
-      finishTask(task, 'Salvo');
+      finishTask(task, 'MP4 salvo no dispositivo');
       saveBlob(merged, filename);
     } catch (error) {
       console.warn('[YouTube Downloader]', error);
       failTask(task, error);
+    } finally {
+      busy.delete(key);
     }
   }
 
   async function startAudioDownload(format) {
+    const videoId = state.videoId;
+    const title = state.formats.title;
+    const key = `audio:${videoId}:${format.itag}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+
     const controller = new AbortController();
-    const filename = `${sanitizeName(state.formats.title)} [${state.videoId}] - áudio.${format.container}`;
-    const task = createTask(filename, controller);
+    const start = state.startAt;
+    const filename = `${sanitizeName(title)} [${videoId}] - áudio${startSuffix(start)}.${format.container}`;
+    const task = createTask(format.container.toUpperCase(), title, controller, filename);
 
     try {
-      const blob = await downloadToBlob(format.url, task, format.size, format.mime);
-      finishTask(task, 'Salvo');
+      let blob = await downloadToBlob(format, task);
+      if (start > 0) {
+        setPct(task, 'Cortando o início…', 0);
+        blob = await remuxMedia({
+          audioBlob: blob,
+          container: format.container === 'webm' ? 'webm' : 'mp4',
+          start,
+          controller,
+          onProgress: (fraction) => setPct(task, 'Cortando o início…', fraction),
+        });
+      }
+      finishTask(task, 'Áudio original salvo');
       saveBlob(blob, filename);
     } catch (error) {
       failTask(task, error);
+    } finally {
+      busy.delete(key);
     }
   }
 
@@ -973,40 +2127,97 @@
     const candidates = audioCandidates(state.formats.formats);
     if (!candidates.length) return;
 
+    const videoId = state.videoId;
+    const title = state.formats.title;
+    const key = `mp3:${videoId}:${kbps}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+
     const controller = new AbortController();
-    const filename = `${sanitizeName(state.formats.title)} [${state.videoId}] - ${kbps}kbps.mp3`;
-    const task = createTask(filename, controller);
+    const start = state.startAt;
+    const filename = `${sanitizeName(title)} [${videoId}] - ${kbps}kbps${startSuffix(start)}.mp3`;
+    const task = createTask(`${kbps}k MP3`, title, controller, filename);
 
     try {
       let audioBuffer = null;
       let lastError = null;
 
       for (const candidate of candidates) {
-        const source = await downloadToBlob(candidate.url, task, candidate.size, candidate.mime);
+        if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+        const source = await downloadToBlob(candidate, task);
+        if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
         try {
-          setPct(task, 'Decodificando áudio', 0);
+          setPct(task, 'Decodificando áudio…', 0);
           audioBuffer = await decodeAudio(source);
           break;
         } catch (error) {
+          if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
           lastError = error;
           console.warn('[YouTube Downloader] Falha ao decodificar', candidate.mime, error);
         }
       }
 
+      if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
       if (!audioBuffer) throw lastError || new Error('Não foi possível decodificar o áudio.');
+      if (start > 0) audioBuffer = sliceAudioBuffer(audioBuffer, start);
 
-      const mp3 = await encodeMp3(audioBuffer, kbps, (fraction) => setPct(task, 'Convertendo para MP3', fraction));
-      finishTask(task, `Salvo em MP3 (${kbps} kbps)`);
+      const mp3 = await encodeMp3(audioBuffer, kbps, task.controller.signal, (fraction) => {
+        if (task.controller.signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+        setPct(task, 'Convertendo para MP3…', fraction);
+      });
+      finishTask(task, `MP3 (${kbps} kbps) salvo`);
       saveBlob(mp3, filename);
     } catch (error) {
       console.warn('[YouTube Downloader]', error);
       failTask(task, error);
+    } finally {
+      busy.delete(key);
     }
   }
 
   /* ------------------------------------------------------------------ *
    *  Renderização
    * ------------------------------------------------------------------ */
+
+  function wireTaskButton(button, keyOrFn, idleTextOrFn, go, withIcon = false) {
+    const icon = withIcon ? createIcon(ICON_ARROW_DOWN, 14, 2.1) : null;
+    const textSpan = document.createElement('span');
+    if (icon) button.append(icon, textSpan);
+    else button.appendChild(textSpan);
+
+    const key = () => (typeof keyOrFn === 'function' ? keyOrFn() : keyOrFn);
+    const getText = () => (typeof idleTextOrFn === 'function' ? idleTextOrFn() : idleTextOrFn);
+
+    const refresh = () => {
+      const active = busy.has(key());
+      button.disabled = active;
+      if (icon) icon.style.display = active ? 'none' : 'block';
+      textSpan.textContent = active ? 'Baixando…' : getText();
+    };
+
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      const promise = go();
+      refresh();
+      if (promise) Promise.resolve(promise).finally(refresh);
+    });
+    refresh();
+    return refresh;
+  }
+
+  function wireIconTaskButton(button, key, go) {
+    const refresh = () => {
+      button.disabled = busy.has(key);
+    };
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      const promise = go();
+      refresh();
+      if (promise) Promise.resolve(promise).finally(refresh);
+    });
+    refresh();
+    return refresh;
+  }
 
   function videoRows(formats) {
     const byHeight = new Map();
@@ -1020,28 +2231,162 @@
 
   function videoScore(format) {
     return (format.hasAudio ? 1000 : 0)
-      + (format.container === 'mp4' ? 100 : 0)
-      + Math.min(99, (format.bitrate || 0) / 1e5);
+      + (format.container === 'mp4' ? 150 : 0)
+      + (/^avc/i.test(format.codec) ? 50 : 0)
+      + Math.min(49, (format.bitrate || 0) / 1e5);
   }
 
-  function qualityText(format) {
-    return `${format.height}p${format.fps >= 50 ? ` ${format.fps}fps` : ''}`;
+  function tierInfo(height) {
+    if (height >= 4320) return { label: '8K', cls: 'tier ultra' };
+    if (height >= 2160) return { label: '4K', cls: 'tier ultra' };
+    if (height >= 1440) return { label: '2K', cls: 'tier ultra' };
+    if (height >= 720) return { label: 'HD', cls: 'tier hd' };
+    return null;
+  }
+
+  function appendMetaItem(parent, text, extraClass = '', tooltip = '') {
+    const item = document.createElement('span');
+    item.className = extraClass ? `meta-item ${extraClass}` : 'meta-item';
+    item.textContent = text;
+    if (tooltip) item.title = tooltip;
+    parent.appendChild(item);
+  }
+
+  function renderLoadingSkeleton() {
+    const wrap = document.createElement('div');
+    wrap.className = 'skeleton-list';
+    const sr = document.createElement('span');
+    sr.className = 'sr-only';
+    sr.textContent = 'Buscando formatos disponíveis…';
+    wrap.appendChild(sr);
+
+    for (let i = 0; i < 4; i++) {
+      const row = document.createElement('div');
+      row.className = 'skel-row';
+      row.setAttribute('aria-hidden', 'true');
+      const meta = document.createElement('div');
+      meta.className = 'skel-meta';
+      const b1 = document.createElement('div');
+      b1.className = 'skel-bar w1';
+      const b2 = document.createElement('div');
+      b2.className = 'skel-bar w2';
+      meta.append(b1, b2);
+      const pill = document.createElement('div');
+      pill.className = 'skel-pill';
+      row.append(meta, pill);
+      wrap.appendChild(row);
+    }
+    el.body.replaceChildren(wrap);
+  }
+
+  function showStateMessage(text) {
+    const box = document.createElement('div');
+    box.className = 'state';
+    const span = document.createElement('span');
+    span.textContent = text;
+    box.appendChild(span);
+    el.body.replaceChildren(box);
+  }
+
+  function currentPlayerTime() {
+    try {
+      const player = document.getElementById('movie_player');
+      if (player && typeof player.getCurrentTime === 'function') return Number(player.getCurrentTime()) || 0;
+    } catch (error) {
+      // player não exposto
+    }
+    const media = document.querySelector('video');
+    return media ? media.currentTime || 0 : 0;
+  }
+
+  function renderStartBar(isVideoTab) {
+    const duration = state.formats.duration || 0;
+    const bar = document.createElement('div');
+    bar.className = 'start-bar';
+
+    const line = document.createElement('div');
+    line.className = 'start-line';
+
+    const label = document.createElement('label');
+    label.className = 'field-label';
+    label.textContent = 'Começar em';
+    label.htmlFor = 'ytdl-start';
+
+    const input = document.createElement('input');
+    input.id = 'ytdl-start';
+    input.className = 'start-input';
+    input.type = 'text';
+    input.inputMode = 'decimal';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.placeholder = '0:00';
+    input.value = state.startAt > 0 ? fmtTimecode(state.startAt) : '';
+    input.setAttribute('aria-describedby', 'ytdl-start-hint');
+
+    const now = document.createElement('button');
+    now.type = 'button';
+    now.className = 'ghost';
+    now.textContent = 'Agora';
+    now.title = 'Usar o tempo atual do player';
+
+    const hint = document.createElement('div');
+    hint.id = 'ytdl-start-hint';
+    hint.className = 'start-hint';
+
+    const apply = (text) => {
+      const value = parseTimecode(text);
+      const invalid = value === null || (duration > 0 && value >= duration);
+      input.setAttribute('aria-invalid', String(invalid));
+      hint.classList.toggle('err', invalid);
+      if (invalid) {
+        state.startAt = 0;
+        hint.textContent = value === null
+          ? 'Use segundos (6) ou minutos:segundos (1:23). Baixando do início.'
+          : `O vídeo tem ${fmtDuration(duration)}. Baixando do início.`;
+        return;
+      }
+      state.startAt = value;
+      hint.textContent = value > 0
+        ? (isVideoTab
+          ? `Do ${fmtTimecode(value)} até o fim. O vídeo começa no quadro-chave mais próximo antes desse ponto.`
+          : `Do ${fmtTimecode(value)} até o fim.`)
+        : 'Vazio baixa desde o início. Ex.: 6 ou 1:23.';
+    };
+
+    // Sem isso os atalhos do YouTube (números, espaço, k, j, l…) agem no player.
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      input.addEventListener(type, (event) => {
+        if (event.key !== 'Escape') event.stopPropagation();
+        if (type === 'keydown' && event.key === 'Enter') input.blur();
+      });
+    }
+    input.addEventListener('input', () => apply(input.value));
+    input.addEventListener('blur', () => {
+      if (input.getAttribute('aria-invalid') !== 'true') {
+        input.value = state.startAt > 0 ? fmtTimecode(state.startAt) : '';
+      }
+    });
+    now.addEventListener('click', () => {
+      const t = Math.floor(currentPlayerTime() * 10) / 10;
+      input.value = t > 0 ? fmtTimecode(t) : '';
+      apply(input.value);
+    });
+
+    apply(input.value);
+    line.append(label, input, now);
+    bar.append(line, hint);
+    el.body.appendChild(bar);
   }
 
   function renderVideo() {
     const rows = videoRows(state.formats.formats);
-    el.body.innerHTML = '';
+    const audioSource = audioCandidates(state.formats.formats).find((f) => f.isAudio);
+    el.body.replaceChildren();
     if (!rows.length) {
-      el.body.innerHTML = '<div class="state">Nenhum formato de vídeo disponível.</div>';
+      showStateMessage('Nenhum formato de vídeo disponível.');
       return;
     }
-
-    if (rows.some((row) => !row.hasAudio)) {
-      const note = document.createElement('div');
-      note.className = 'note';
-      note.textContent = 'Acima de 720p o YouTube entrega vídeo e áudio em faixas separadas. Em "MP4 com áudio", as duas faixas são baixadas e unidas aqui no navegador, sem perder qualidade.';
-      el.body.appendChild(note);
-    }
+    renderStartBar(true);
 
     const list = document.createElement('div');
     list.className = 'list';
@@ -1053,50 +2398,97 @@
       const meta = document.createElement('div');
       meta.className = 'meta';
 
-      const quality = document.createElement('div');
+      const qLine = document.createElement('div');
+      qLine.className = 'q-line';
+
+      const quality = document.createElement('span');
       quality.className = 'q';
-      quality.textContent = qualityText(format);
+      quality.textContent = `${format.height}p`;
+      qLine.appendChild(quality);
+
+      const tier = tierInfo(format.height);
+      if (tier) {
+        const tBadge = document.createElement('span');
+        tBadge.className = tier.cls;
+        tBadge.textContent = tier.label;
+        qLine.appendChild(tBadge);
+      }
+
+      if (format.fps >= 50) {
+        const fpsBadge = document.createElement('span');
+        fpsBadge.className = 'tier fps';
+        fpsBadge.textContent = `${format.fps}fps`;
+        qLine.appendChild(fpsBadge);
+      }
 
       const sub = document.createElement('div');
       sub.className = 'sub';
-      sub.append(document.createTextNode(`${format.container.toUpperCase()} · ${codecName(format.codec)} · `));
 
-      const tag = document.createElement('span');
-      tag.className = format.hasAudio ? 'tag ok' : 'tag warn';
-      tag.textContent = format.hasAudio ? 'com áudio' : 'sem áudio';
-      sub.append(tag);
+      appendMetaItem(sub, format.hasAudio ? format.container.toUpperCase() : 'MP4');
+      appendMetaItem(sub, codecName(format.codec));
 
-      if (format.size) sub.append(document.createTextNode(` · ${fmtBytes(format.size)}`));
+      if (format.size) {
+        if (!format.hasAudio && audioSource && audioSource.size) {
+          const totalBytes = format.size + audioSource.size;
+          appendMetaItem(
+            sub,
+            fmtBytes(totalBytes),
+            '',
+            `Vídeo: ${fmtBytes(format.size)} + Áudio: ${fmtBytes(audioSource.size)}`,
+          );
+        } else {
+          appendMetaItem(sub, fmtBytes(format.size));
+        }
+      }
 
-      meta.append(quality, sub);
+      if (format.hasAudio) {
+        appendMetaItem(sub, 'direto', 'ok');
+      }
 
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'primary sm';
-      button.textContent = format.hasAudio ? 'Baixar' : 'MP4 com áudio';
-      button.addEventListener('click', () => {
-        if (format.hasAudio) startVideoDownload(format);
-        else startMergedDownload(format);
-      });
+      meta.append(qLine, sub);
 
       const actions = document.createElement('div');
       actions.className = 'row-actions';
-      actions.appendChild(button);
 
       if (!format.hasAudio) {
         const solo = document.createElement('button');
         solo.type = 'button';
-        solo.className = 'ghost sm';
-        solo.textContent = 'só vídeo';
-        solo.addEventListener('click', () => startVideoDownload(format));
+        solo.className = 'icon-ghost';
+        const soloHint = format.size
+          ? `Baixar vídeo sem áudio (${fmtBytes(format.size)})`
+          : 'Baixar vídeo sem áudio';
+        solo.title = soloHint;
+        solo.setAttribute('aria-label', `Baixar ${format.height}p sem áudio`);
+        solo.appendChild(createIcon(ICON_MUTE, 15, 1.85));
+        wireIconTaskButton(solo, `video:${state.videoId}:${format.itag}`, () => startVideoDownload(format));
         actions.appendChild(solo);
       }
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'primary sm';
+      button.setAttribute('aria-label', `Baixar vídeo em ${format.height}p MP4 com áudio`);
+      wireTaskButton(
+        button,
+        format.hasAudio ? `video:${state.videoId}:${format.itag}` : `merge:${state.videoId}:${format.itag}`,
+        'Baixar',
+        () => (format.hasAudio ? startVideoDownload(format) : startMergedDownload(format)),
+        true,
+      );
+      actions.appendChild(button);
 
       row.append(meta, actions);
       list.appendChild(row);
     }
 
     el.body.appendChild(list);
+
+    if (rows.some((row) => !row.hasAudio)) {
+      const foot = document.createElement('div');
+      foot.className = 'foot-note';
+      foot.textContent = 'Vídeo e áudio são baixados em paralelo e unidos em MP4 no navegador, sem perda de qualidade.';
+      el.body.appendChild(foot);
+    }
   }
 
   function pickAudio(formats) {
@@ -1105,20 +2497,34 @@
 
   function renderAudio() {
     const format = pickAudio(state.formats.formats);
-    el.body.innerHTML = '';
+    el.body.replaceChildren();
 
     if (!format) {
-      el.body.innerHTML = '<div class="state">Nenhum áudio disponível neste vídeo.</div>';
+      showStateMessage('Nenhum áudio disponível neste vídeo.');
       return;
     }
+    renderStartBar(false);
 
+    const durationSec = state.formats.duration || 0;
     const card = document.createElement('div');
     card.className = 'audio-card';
 
-    const sourceInfo = document.createElement('div');
-    sourceInfo.className = 'src';
+    const srcRow = document.createElement('div');
+    srcRow.className = 'audio-src';
+    const srcLabel = document.createElement('span');
+    srcLabel.className = 'audio-src-label';
+    srcLabel.textContent = 'Faixa original';
+    const srcVal = document.createElement('span');
+    srcVal.className = 'audio-src-val';
     const rate = format.sampleRate ? `${Math.round(format.sampleRate / 1000)} kHz` : '';
-    sourceInfo.textContent = `Origem: ${codecName(format.codec)}${format.bitrate ? ` · ${Math.round(format.bitrate / 1000)} kbps` : ''}${rate ? ` · ${rate}` : ''}${format.size ? ` · ${fmtBytes(format.size)}` : ''}`;
+    const parts = [
+      codecName(format.codec),
+      format.bitrate ? `${Math.round(format.bitrate / 1000)} kbps` : '',
+      rate,
+      format.size ? fmtBytes(format.size) : '',
+    ].filter(Boolean);
+    srcVal.textContent = parts.join(' · ');
+    srcRow.append(srcLabel, srcVal);
 
     const bitrateField = document.createElement('div');
     const bitrateLabel = document.createElement('div');
@@ -1126,49 +2532,88 @@
     bitrateLabel.textContent = 'Qualidade do MP3';
     const chips = document.createElement('div');
     chips.className = 'chips';
-
-    for (const kbps of [128, 192, 320]) {
-      const chip = document.createElement('button');
-      chip.type = 'button';
-      chip.className = `chip${state.kbps === kbps ? ' active' : ''}`;
-      chip.textContent = `${kbps} kbps`;
-      chip.addEventListener('click', () => {
-        state.kbps = kbps;
-        chips.querySelectorAll('.chip').forEach((el) => el.classList.remove('active'));
-        chip.classList.add('active');
-      });
-      chips.appendChild(chip);
-    }
-
-    bitrateField.append(bitrateLabel, chips);
+    chips.setAttribute('role', 'group');
+    chips.setAttribute('aria-label', 'Qualidade do MP3');
 
     const actions = document.createElement('div');
     actions.className = 'actions';
 
     const mp3Button = document.createElement('button');
     mp3Button.type = 'button';
-    mp3Button.className = 'primary';
-    mp3Button.textContent = 'Baixar MP3';
-    mp3Button.addEventListener('click', () => startMp3Download(state.kbps));
+    mp3Button.className = 'primary lg';
+    const refreshMp3Button = wireTaskButton(
+      mp3Button,
+      () => `mp3:${state.videoId}:${state.kbps}`,
+      () => `Baixar MP3 · ${state.kbps} kbps`,
+      () => startMp3Download(state.kbps),
+      true,
+    );
+    actions.appendChild(mp3Button);
 
-    const rawButton = document.createElement('button');
-    rawButton.type = 'button';
-    rawButton.className = 'ghost';
-    rawButton.textContent = `Baixar áudio original (.${format.container})`;
-    rawButton.addEventListener('click', () => startAudioDownload(format));
+    if (format.isAudio) {
+      const rawButton = document.createElement('button');
+      rawButton.type = 'button';
+      rawButton.className = 'ghost lg';
+      const rawLabel = format.size
+        ? `Salvar áudio original (.${format.container} · ${fmtBytes(format.size)})`
+        : `Salvar áudio original (.${format.container})`;
+      wireTaskButton(
+        rawButton,
+        `audio:${state.videoId}:${format.itag}`,
+        rawLabel,
+        () => startAudioDownload(format),
+      );
+      actions.appendChild(rawButton);
+    }
 
-    actions.append(mp3Button, rawButton);
-    card.append(sourceInfo, bitrateField, actions);
+    const presets = [
+      { kbps: 128, hint: 'Compacto' },
+      { kbps: 192, hint: 'Equilibrado' },
+      { kbps: 320, hint: 'Máxima' },
+    ];
+
+    for (const { kbps, hint } of presets) {
+      const active = state.kbps === kbps;
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = `chip${active ? ' active' : ''}`;
+      chip.setAttribute('aria-pressed', String(active));
+
+      const main = document.createElement('span');
+      main.className = 'chip-kbps';
+      main.textContent = `${kbps} kbps`;
+
+      const est = document.createElement('span');
+      est.className = 'chip-est';
+      est.textContent = durationSec > 0
+        ? `~${fmtBytes((durationSec * kbps * 1000) / 8)}`
+        : hint;
+
+      chip.append(main, est);
+      chip.addEventListener('click', () => {
+        state.kbps = kbps;
+        for (const other of chips.querySelectorAll('.chip')) {
+          const isCurrent = other === chip;
+          other.classList.toggle('active', isCurrent);
+          other.setAttribute('aria-pressed', String(isCurrent));
+        }
+        refreshMp3Button();
+      });
+      chips.appendChild(chip);
+    }
+
+    bitrateField.append(bitrateLabel, chips);
+    card.append(srcRow, bitrateField, actions);
     el.body.appendChild(card);
   }
 
   function renderBody() {
     if (!state.videoId) {
-      el.body.innerHTML = '';
+      showStateMessage('Abra um vídeo para listar os formatos disponíveis.');
       return;
     }
     if (state.loading) {
-      el.body.innerHTML = '<div class="state"><span class="spinner"></span><span>Buscando formatos…</span></div>';
+      renderLoadingSkeleton();
       return;
     }
     if (state.error) {
@@ -1182,12 +2627,11 @@
       retry.textContent = 'Tentar novamente';
       retry.addEventListener('click', () => ensureFormats(state.videoId, true));
       box.append(message, retry);
-      el.body.innerHTML = '';
-      el.body.appendChild(box);
+      el.body.replaceChildren(box);
       return;
     }
     if (!state.formats) {
-      el.body.innerHTML = '';
+      el.body.replaceChildren();
       return;
     }
     if (state.tab === 'video') renderVideo();
@@ -1195,108 +2639,218 @@
   }
 
   /* ------------------------------------------------------------------ *
-   *  Carregamento
+   *  Carregamento e pré-busca
    * ------------------------------------------------------------------ */
 
   async function ensureFormats(videoId, force = false) {
     if (!videoId) return;
 
     if (!force && state.cache.has(videoId)) {
-      state.formats = state.cache.get(videoId);
-      state.loading = false;
-      state.error = null;
-      renderBody();
+      const cached = state.cache.get(videoId);
+      if (state.videoId === videoId) {
+        state.formats = cached;
+        state.loading = false;
+        state.error = null;
+        syncHeaderMeta();
+        if (state.open) renderBody();
+      }
       return;
     }
 
-    state.loading = true;
-    state.error = null;
-    state.formats = null;
-    renderBody();
+    if (!force && inflightFormats.has(videoId)) {
+      return inflightFormats.get(videoId);
+    }
 
-    try {
-      const data = await loadFormats(videoId);
-      state.cache.set(videoId, data);
-      if (state.videoId !== videoId) return;
-      state.formats = data;
-      state.loading = false;
-      el.title.textContent = data.title;
-      renderBody();
-    } catch (error) {
-      if (state.videoId !== videoId) return;
-      state.loading = false;
-      state.error = error.message || String(error);
-      renderBody();
+    if (state.videoId === videoId) {
+      state.loading = true;
+      state.error = null;
+      state.formats = null;
+      if (state.open) renderBody();
+    }
+
+    const job = (async () => {
+      try {
+        const data = await loadFormats(videoId);
+        state.cache.set(videoId, data);
+        if (state.videoId !== videoId) return;
+        state.formats = data;
+        state.loading = false;
+        syncHeaderMeta();
+        if (state.open) renderBody();
+      } catch (error) {
+        if (state.videoId !== videoId) return;
+        state.loading = false;
+        state.error = error.message || String(error);
+        if (state.open) renderBody();
+      } finally {
+        inflightFormats.delete(videoId);
+      }
+    })();
+
+    inflightFormats.set(videoId, job);
+    return job;
+  }
+
+  function warmFormats() {
+    if (state.videoId && !state.cache.has(state.videoId) && !inflightFormats.has(state.videoId)) {
+      ensureFormats(state.videoId);
     }
   }
 
   function openPanel() {
-    if (!state.videoId) return;
+    if (!state.videoId && tasks.size === 0) return;
     state.open = true;
     el.panel.hidden = false;
-    el.title.textContent = videoTitle();
+    el.fab.setAttribute('aria-expanded', 'true');
+    el.inlineBtn.setAttribute('aria-expanded', 'true');
+    syncHeaderMeta();
+    positionPanel();
     renderBody();
-    if (!state.formats && !state.loading) ensureFormats(state.videoId);
+    if (state.videoId && !state.formats && !state.loading) {
+      ensureFormats(state.videoId);
+    }
   }
 
   function closePanel() {
+    if (!state.open) return;
+    const hadFocus = el.panel.contains(root.activeElement);
     state.open = false;
     el.panel.hidden = true;
+    el.fab.setAttribute('aria-expanded', 'false');
+    el.inlineBtn.setAttribute('aria-expanded', 'false');
+    if (hadFocus) {
+      if (isInlineVisible()) el.inlineBtn.focus();
+      else if (!el.fab.hidden) el.fab.focus();
+    }
   }
 
   /* ------------------------------------------------------------------ *
    *  Eventos e navegação
    * ------------------------------------------------------------------ */
 
-  el.fab.addEventListener('click', () => {
+  function togglePanel() {
     if (state.open) closePanel();
     else openPanel();
-  });
+  }
 
+  el.inlineBtn.addEventListener('pointerenter', warmFormats, { passive: true });
+  el.inlineBtn.addEventListener('focus', warmFormats, { passive: true });
+  el.fab.addEventListener('pointerenter', warmFormats, { passive: true });
+  el.fab.addEventListener('focus', warmFormats, { passive: true });
+
+  el.inlineBtn.addEventListener('click', togglePanel);
+  el.fab.addEventListener('click', togglePanel);
   el.close.addEventListener('click', closePanel);
+
+  document.addEventListener('pointerdown', (event) => {
+    if (!state.open) return;
+    const path = event.composedPath();
+    if (path.includes(el.panel) || path.includes(el.inlineBtn) || path.includes(el.fab)) return;
+    closePanel();
+  });
 
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && state.open) {
-      event.stopPropagation();
+      if (el.panel.contains(root.activeElement)) {
+        event.stopPropagation();
+      }
       closePanel();
     }
   }, true);
 
-  for (const tab of el.tabs) {
-    tab.addEventListener('click', () => {
-      state.tab = tab.dataset.tab;
-      for (const other of el.tabs) other.classList.toggle('active', other === tab);
-      renderBody();
+  window.addEventListener('resize', () => {
+    mountInlineButton();
+    if (state.open) positionPanel();
+  }, { passive: true });
+
+  window.addEventListener('scroll', () => {
+    if (state.open) positionPanel();
+  }, { passive: true, capture: true });
+
+  function selectTab(tab, focus = false) {
+    state.tab = tab.dataset.tab;
+    for (const other of el.tabs) {
+      const active = other === tab;
+      other.classList.toggle('active', active);
+      other.setAttribute('aria-selected', String(active));
+      other.tabIndex = active ? 0 : -1;
+    }
+    if (focus) tab.focus();
+    renderBody();
+  }
+
+  for (const [index, tab] of el.tabs.entries()) {
+    tab.addEventListener('click', () => selectTab(tab));
+    tab.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+        event.preventDefault();
+        const dir = event.key === 'ArrowRight' ? 1 : -1;
+        const next = el.tabs[(index + dir + el.tabs.length) % el.tabs.length];
+        selectTab(next, true);
+      }
+    });
+  }
+
+  let mountRaf = 0;
+  function scheduleMount() {
+    if (mountRaf) return;
+    mountRaf = requestAnimationFrame(() => {
+      mountRaf = 0;
+      mountInlineButton();
+    });
+  }
+
+  if (document.body) {
+    new MutationObserver(scheduleMount).observe(document.body, {
+      childList: true,
+      subtree: true,
     });
   }
 
   function sync() {
     const id = currentVideoId();
-    el.fab.hidden = !id;
+    mountInlineButton();
 
     if (!id) {
-      closePanel();
       state.videoId = null;
+      state.formats = null;
+      state.error = null;
+      state.loading = false;
+      updateTriggerVisibility();
+      if (tasks.size === 0) {
+        closePanel();
+      } else if (state.open) {
+        syncHeaderMeta();
+        renderBody();
+      }
       return;
     }
 
     if (state.videoId !== id) {
       state.videoId = id;
-      state.formats = null;
+      state.startAt = 0;
+      state.formats = state.cache.get(id) || null;
       state.error = null;
-      state.loading = false;
-      if (state.open) ensureFormats(id);
-      else el.title.textContent = videoTitle();
+      state.loading = inflightFormats.has(id);
+      updateTriggerVisibility();
+      syncHeaderMeta();
+      if (state.open) {
+        renderBody();
+        if (!state.formats && !state.loading) ensureFormats(id);
+      }
     } else if (!state.open) {
-      el.title.textContent = videoTitle();
+      syncHeaderMeta();
     }
   }
 
   document.addEventListener('yt-navigate-finish', sync);
+  document.addEventListener('yt-page-data-updated', sync);
   window.addEventListener('popstate', sync);
-  setTimeout(sync, 300);
+  sync();
+  setTimeout(sync, 400);
+  setTimeout(sync, 1200);
 
-  console.info('[YouTube Downloader] Carregado. Botão disponível em páginas de vídeo.');
+  console.info('[YouTube Downloader] Carregado.');
 })();
 
 /* ------------------------------------------------------------------ *
